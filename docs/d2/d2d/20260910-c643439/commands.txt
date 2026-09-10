@@ -1,0 +1,17 @@
+# D2-D commands (actual)
+
+1. cargo test --offline --workspace --exclude observer --exclude narrator
+   log: cargo-test.txt
+   EXIT_CODE=0
+   observer/narrator excluded; ignored resource_reversal_20_seeds_full was NOT executed
+
+2. cargo run --offline -p universe_lab --bin d2 -- docs/d2/d2d/20260910-c643439/short
+   log: d2-short.txt
+   EXIT_CODE=0
+   short probe budget: see sampling.md (written by bin d2d); H<=12, pre-registered FB01/EX02/AR02/R04-dark/MV04-unit
+
+3. cargo run --release --offline -p universe_lab --bin d2d -- docs/d2/d2d/20260910-c643439
+   log: d2d-c5.txt
+   EXIT_CODE=0
+   valid_complete=true rows=40
+   C5 wall inside binary elapsed_ms=5688; process including compile ~16953 ms

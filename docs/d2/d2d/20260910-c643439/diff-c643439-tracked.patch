@@ -1,0 +1,204 @@
+﻿diff --git a/crates/universe_lab/src/experiment.rs b/crates/universe_lab/src/experiment.rs
+index 28b7562..fba5451 100644
+--- a/crates/universe_lab/src/experiment.rs
++++ b/crates/universe_lab/src/experiment.rs
+@@ -1,5 +1,8 @@
+ //! Canonical experiment definition, source identity, and restorable runtime packs.
+ 
++use std::fs;
++use std::path::{Path, PathBuf};
++
+ use universe_core::probe::ControlMode;
+ use universe_core::world::World;
+ use universe_types::{
+@@ -7,6 +10,22 @@ use universe_types::{
+     WorldState,
+ };
+ 
++/// Algorithm id for the file-list execution digest (not `git diff HEAD`).
++pub const SOURCE_DIGEST_ALGO: &str = "eu-source-digest-v1";
++
++/// Workspace paths that can change C5 / lab execution. Results under `docs/`
++/// are excluded so writing artefacts does not invalidate a frozen batch.
++pub const EXECUTION_SOURCE_ROOTS: &[&str] = &[
++    "Cargo.toml",
++    "Cargo.lock",
++    "rust-toolchain.toml",
++    "crates/universe_types",
++    "crates/universe_core",
++    "crates/universe_archive",
++    "crates/universe_lab",
++    "apps/narrator",
++];
++
+ #[derive(Clone, Debug)]
+ pub struct SourceIdentity {
+     pub commit: String,
+@@ -45,6 +64,155 @@ pub fn source_identity() -> SourceIdentity {
+     }
+ }
+ 
++#[derive(Clone, Debug)]
++pub struct SourceFileEntry {
++    pub path: String,
++    pub sha256: String,
++}
++
++#[derive(Clone, Debug)]
++pub struct ExecutionSourceManifest {
++    pub algorithm: String,
++    pub digest: String,
++    pub files: Vec<SourceFileEntry>,
++    pub git_commit: String,
++    pub git_dirty: bool,
++    pub git_porcelain: String,
++    pub execution_source_differs_from_head: bool,
++    pub rustc: String,
++    pub cargo: String,
++}
++
++pub fn workspace_root() -> Result<PathBuf, String> {
++    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++    let crates = manifest
++        .parent()
++        .ok_or_else(|| "universe_lab Cargo.toml has no parent".to_string())?;
++    crates
++        .parent()
++        .ok_or_else(|| "crates/ has no parent".to_string())
++        .map(Path::to_path_buf)
++}
++
++fn skip_dir_name(name: &std::ffi::OsStr) -> bool {
++    name == "target" || name == ".git"
++}
++
++fn collect_rel_paths(root: &Path) -> Result<Vec<String>, String> {
++    let mut out = Vec::new();
++    for rel in EXECUTION_SOURCE_ROOTS {
++        let path = root.join(rel);
++        if !path.exists() {
++            return Err(format!("execution source missing: {rel}"));
++        }
++        if path.is_file() {
++            out.push((*rel).to_string());
++            continue;
++        }
++        let mut stack = vec![path];
++        while let Some(dir) = stack.pop() {
++            let rd = fs::read_dir(&dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
++            for ent in rd {
++                let ent = ent.map_err(|e| e.to_string())?;
++                if skip_dir_name(&ent.file_name()) {
++                    continue;
++                }
++                let p = ent.path();
++                if p.is_dir() {
++                    stack.push(p);
++                } else {
++                    let rel_path = p
++                        .strip_prefix(root)
++                        .map_err(|e| e.to_string())?
++                        .to_string_lossy()
++                        .replace('\\', "/");
++                    if rel_path.starts_with("docs/") {
++                        continue;
++                    }
++                    out.push(rel_path);
++                }
++            }
++        }
++    }
++    out.sort();
++    out.dedup();
++    Ok(out)
++}
++
++fn git_output(args: &[&str], cwd: &Path) -> Result<Vec<u8>, String> {
++    let o = std::process::Command::new("git")
++        .args(args)
++        .current_dir(cwd)
++        .output()
++        .map_err(|e| e.to_string())?;
++    if !o.status.success() {
++        return Err(format!(
++            "git {} failed: {}",
++            args.join(" "),
++            String::from_utf8_lossy(&o.stderr)
++        ));
++    }
++    Ok(o.stdout)
++}
++
++pub fn execution_source_manifest() -> Result<ExecutionSourceManifest, String> {
++    let root = workspace_root()?;
++    let paths = collect_rel_paths(&root)?;
++    let mut files = Vec::with_capacity(paths.len());
++    let mut canon = Vec::new();
++    canon.extend_from_slice(SOURCE_DIGEST_ALGO.as_bytes());
++    canon.push(b'\n');
++    for rel in &paths {
++        let bytes = fs::read(root.join(rel)).map_err(|e| format!("read {rel}: {e}"))?;
++        let h = hex_hash(&sha256(&bytes));
++        canon.extend_from_slice(rel.as_bytes());
++        canon.push(b'\t');
++        canon.extend_from_slice(h.as_bytes());
++        canon.push(b'\n');
++        files.push(SourceFileEntry {
++            path: rel.clone(),
++            sha256: h,
++        });
++    }
++    let digest = hex_hash(&sha256(&canon));
++    let porcelain = String::from_utf8_lossy(&git_output(&["status", "--porcelain"], &root)?)
++        .replace("\r\n", "\n");
++    let mut diff_args = vec!["diff", "--name-only", "HEAD", "--"];
++    diff_args.extend(EXECUTION_SOURCE_ROOTS.iter().copied());
++    let changed = String::from_utf8_lossy(&git_output(&diff_args, &root)?).replace("\r\n", "\n");
++    let mut untracked_args = vec!["ls-files", "--others", "--exclude-standard", "--"];
++    untracked_args.extend(EXECUTION_SOURCE_ROOTS.iter().copied());
++    let untracked =
++        String::from_utf8_lossy(&git_output(&untracked_args, &root)?).replace("\r\n", "\n");
++    let execution_source_differs_from_head =
++        changed.lines().any(|l| !l.is_empty()) || untracked.lines().any(|l| !l.is_empty());
++    let rustc = std::process::Command::new("rustc")
++        .arg("--version")
++        .output()
++        .ok()
++        .and_then(|o| String::from_utf8(o.stdout).ok())
++        .map(|s| s.trim().to_string())
++        .unwrap_or_else(|| "unknown".into());
++    let cargo = std::process::Command::new("cargo")
++        .arg("--version")
++        .output()
++        .ok()
++        .and_then(|o| String::from_utf8(o.stdout).ok())
++        .map(|s| s.trim().to_string())
++        .unwrap_or_else(|| "unknown".into());
++    Ok(ExecutionSourceManifest {
++        algorithm: SOURCE_DIGEST_ALGO.into(),
++        digest,
++        files,
++        git_commit: crate::d1::git_commit(),
++        git_dirty: !porcelain.trim().is_empty(),
++        git_porcelain: porcelain,
++        execution_source_differs_from_head,
++        rustc,
++        cargo,
++    })
++}
++
+ #[derive(Clone, Debug)]
+ pub struct ExperimentDef {
+     pub name: String,
+diff --git a/crates/universe_lab/src/lib.rs b/crates/universe_lab/src/lib.rs
+index c0ef844..0bc4e82 100644
+--- a/crates/universe_lab/src/lib.rs
++++ b/crates/universe_lab/src/lib.rs
+@@ -8,6 +8,7 @@ use universe_types::{BrainState, RuleSpec, PHI, POLICY_LOGITS};
+ 
+ pub mod d1;
+ pub mod d2;
++pub mod d2d;
+ pub mod experiment;
+ 
+ /// Chapter 42.4 readout reversal, one seed.

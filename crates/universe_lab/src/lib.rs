@@ -8,6 +8,7 @@ use universe_types::{BrainState, RuleSpec, PHI, POLICY_LOGITS};
 
 pub mod d1;
 pub mod d2;
+pub mod d2d;
 pub mod experiment;
 
 /// Chapter 42.4 readout reversal, one seed.

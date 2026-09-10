@@ -1,0 +1,168 @@
+   Compiling universe_lab v0.1.0 (D:\cursor-project\e-uni\crates\universe_lab)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.33s
+     Running unittests src\lib.rs (target\debug\deps\universe_archive-a3f8cd0a6dd5d276.exe)
+
+running 6 tests
+test tests::first_diff_tick ... ok
+test tests::open_rejects_rules_mismatch ... ok
+test tests::rename_failure_does_not_register_snapshot ... ok
+test tests::event_retry_is_idempotent ... ok
+test tests::snapshot_roundtrip_hash ... ok
+test tests::s0_restores_before_periodic_snapshot ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running unittests src\lib.rs (target\debug\deps\universe_core-570828059f971d05.exe)
+
+running 58 tests
+test d1_tests::p_equals_e_plus_eight_c ... ok
+test d1_tests::p3_old_energy_cannot_use_e_new ... ok
+test d1_tests::interval_feedback_records_photo_in_light ... ok
+test d2_tests::ex03_nonempty_future_inputs_rejected ... ok
+test d2_tests::fb01_first_complete_feedback_on_decision ... ok
+test d2_tests::fb02_interval_switches ... ok
+test d1_tests::coincident_bodies_unresolved_keeps_boundary ... ok
+test d2_tests::lighting_change_syncs_rules_hash ... ok
+test d2_tests::low_stock_retargets_m0_u0 ... ok
+test g1_tests::t02_photosynthesis ... ok
+test d2_tests::mv01_open_field_full_thrust ... ok
+test g1_tests::t03_organic_uptake ... ok
+test g1_tests::t04_catabolism ... ok
+test g1_tests::t07_no_spend_of_new_energy ... ok
+test d1_tests::overcrowded_pairs_pause_keeps_boundary ... ok
+test g1_tests::t06_multi_input_no_second_allocation ... ok
+test g1_tests::t05_single_pool_quota_order_independent ... ok
+test d2_tests::p0_energy_not_post_maintenance ... ok
+test d2_tests::fb03_skipped_decision_consumes_once ... ok
+test d2_tests::fb04_same_frame_neural_and_reflex ... ok
+test d2_tests::mv02_wall_paid_but_no_progress ... ok
+test g1_tests::t09_decay_remainders ... ok
+test d2_tests::mv04_partial_pay_logged ... ok
+test g1_tests::t08_diffusion_center ... ok
+test d1_tests::probe_does_not_change_state_hash ... ok
+test g2_tests::t12_two_disk_projection ... ok
+test d2_tests::mv03_full_turn_unwraps ... ok
+test g2_tests::wrap_angle_range ... ok
+test g3_tests::t13_bernoulli_grad ... ok
+test d2_tests::at01_readout_update_then_injected_fault_restores ... ok
+test g3_tests::td_numeric_example ... ok
+test g1_tests::t01_initialization_totals ... ok
+test g3_tests::genome_factory_deterministic ... ok
+test g4_tests::full_extent_accounts ... ok
+test g2_tests::death_threshold_integer ... ok
+test rng::tests::encoding_matches_spec_example ... ok
+test g2_tests::t11_death_deposit ... ok
+test rng::tests::field_overflow_rejected ... ok
+test rng::tests::philox_kat_ones ... ok
+test rng::tests::observer_rng_does_not_change_philox ... ok
+test rng::tests::philox_kat_pi ... ok
+test g2_tests::safety_pause_on_living_cap ... ok
+test rng::tests::philox_kat_zero ... ok
+test rng::tests::quota_draw_index_formula ... ok
+test rng::tests::range_uses_reserved_slots ... ok
+test rng::tests::unit_interval_in_range ... ok
+test g4_tests::extra_maintenance_with_embryo ... ok
+test g4_tests::mutation_copies_encoding_not_weights ... ok
+test g3_tests::t14_brain_isolation ... ok
+test g1_tests::seed_does_not_change_t01_totals ... ok
+test g4_tests::t10_embryo_cancel_deposit ... ok
+test g4_tests::start_fee_not_refunded_on_cancel ... ok
+test d1_tests::inject_each_fault_point_preserves_committed_bytes ... ok
+test g1_tests::lifeless_field_mass_energy_identity ... ok
+test g2_tests::replay_hash_matches ... ok
+test g3_tests::decision_boundary_snapshot_restore ... ok
+test g2_tests::stationary_autotroph_survives_in_light ... ok
+test g2_tests::dark_world_consumes_finite_reserve ... ok
+
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.83s
+
+     Running unittests src\lib.rs (target\debug\deps\universe_lab-59af42bf8905a2dc.exe)
+
+running 22 tests
+test d2::tests::experiment_hash_changes_with_seed_and_controller ... ok
+test d2d::tests::p_identity_zero_on_balanced_ledger ... ok
+test d2d::tests::isolation_accepts_reversal_spec ... ok
+test d2d::tests::experiment_hash_stable_and_sensitive ... ok
+test tests::bootstrap_recovers_constant_diff ... ok
+test tests::resource_reversal_20_seeds_full ... ignored
+test tests::readout_smoke_one_hundred_not_nan ... ok
+test d1::tests::oracle_holds_control_for_five_ticks ... ok
+test tests::reversal_map_inits ... ok
+test d2d::tests::learn_freeze_share_initial_hash ... ok
+test tests::reversal_short_smoke ... ok
+test tests::measure_short_reversal_runtime ... ok
+test tests::narrator_does_not_change_state_hash ... ok
+test d2::tests::s0_restore_replays_without_periodic_snapshot ... ok
+test tests::archive_batch_and_replay_short ... ok
+test d2d::tests::pair_by_seed_does_not_use_push_order ... ok
+test d1::tests::action_costs_match_ledger ... ok
+test d1::tests::c3_reaches_old_light_short ... ok
+test d2::tests::report_refuses_pass_on_error ... ok
+test d2::tests::d2_short_cases_ok ... ok
+test d2d::tests::source_digest_covers_lockfile_not_docs ... ok
+test tests::readout_one_seed_finite ... ok
+
+test result: ok. 21 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.93s
+
+     Running unittests src\bin\d1.rs (target\debug\deps\d1-64c755725fc2f7b0.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\d2.rs (target\debug\deps\d2-11f612d4764a64d9.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\d2d.rs (target\debug\deps\d2d-767c27b8f0d978fd.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\universe_types-d43f7542ef3dc7a3.exe)
+
+running 8 tests
+test tests::canonical_state_roundtrip ... ok
+test tests::presentation_not_in_rules_hash ... ok
+test tests::t01_from_rule_spec ... ok
+test tests::negative_zero_normalized ... ok
+test tests::illegal_learning_rejected ... ok
+test tests::units_micro ... ok
+test tests::yaml_unknown_key_rejected ... ok
+test tests::yaml_whitespace_does_not_change_rules_hash ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests universe_archive
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests universe_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests universe_lab
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests universe_types
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+EXIT_CODE=0
+ELAPSED_MS=29597
+EXCLUDED=observer,narrator
+IGNORED_FULL_REVERSAL_NOT_EXECUTED=true
+

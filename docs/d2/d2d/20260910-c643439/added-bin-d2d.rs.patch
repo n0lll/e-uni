@@ -1,0 +1,29 @@
+warning: in the working copy of 'crates/universe_lab/src/bin/d2d.rs', LF will be replaced by CRLF the next time Git touches it
+diff --git a/crates/universe_lab/src/bin/d2d.rs b/crates/universe_lab/src/bin/d2d.rs
+new file mode 100644
+index 0000000..fd9f6de
+--- /dev/null
++++ b/crates/universe_lab/src/bin/d2d.rs
+@@ -0,0 +1,22 @@
++//! Write D2-D C5 artefacts under docs/d2/d2d/<run_id> (or a given directory).
++
++fn main() {
++    let out = std::env::args()
++        .nth(1)
++        .unwrap_or_else(|| "docs/d2/d2d/latest".to_string());
++    match universe_lab::d2d::run_d2d_campaign(&out) {
++        Ok(report) => {
++            eprintln!(
++                "D2-D wrote {out} valid_complete={} rows={}",
++                report.integrity.valid_complete, report.integrity.n_rows
++            );
++            if !report.integrity.valid_complete {
++                std::process::exit(2);
++            }
++        }
++        Err(e) => {
++            eprintln!("D2-D failed: {e}");
++            std::process::exit(1);
++        }
++    }
++}

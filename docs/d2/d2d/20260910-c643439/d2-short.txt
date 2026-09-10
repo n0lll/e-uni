@@ -1,0 +1,8 @@
+   Compiling universe_lab v0.1.0 (D:\cursor-project\e-uni\crates\universe_lab)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.77s
+     Running `target\debug\d2.exe docs/d2/d2d/20260910-c643439/short`
+D2 wrote docs/d2/d2d/20260910-c643439/short
+
+EXIT_CODE=0
+ELAPSED_MS=1907
+

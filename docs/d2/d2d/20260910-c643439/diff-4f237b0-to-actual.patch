@@ -1,0 +1,3836 @@
+﻿diff --git a/crates/universe_archive/src/lib.rs b/crates/universe_archive/src/lib.rs
+index afce1a7..b37ecc2 100644
+--- a/crates/universe_archive/src/lib.rs
++++ b/crates/universe_archive/src/lib.rs
+@@ -32,6 +32,8 @@ pub struct Archive {
+     last_batch_tick: u64,
+     /// Test hook: fail after tmp write, before rename/SQLite register.
+     pub fail_before_rename: bool,
++    /// Test hook: fail after inserting this many events in `record_committed`.
++    pub fail_event_after: Option<usize>,
+ }
+ 
+ impl Archive {
+@@ -56,12 +58,13 @@ impl Archive {
+                 content_hash BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS events (
+-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 tick INTEGER NOT NULL,
++                local_index INTEGER NOT NULL,
+                 kind INTEGER NOT NULL,
+                 a INTEGER NOT NULL,
+                 b INTEGER NOT NULL,
+-                amount INTEGER NOT NULL
++                amount INTEGER NOT NULL,
++                PRIMARY KEY (tick, local_index)
+             );
+             CREATE TABLE IF NOT EXISTS hashes (
+                 tick INTEGER PRIMARY KEY,
+@@ -80,11 +83,29 @@ impl Archive {
+         )
+         .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+         let rules = spec.encode_canonical().map_err(SimError::from)?;
+-        db.execute(
+-            "INSERT OR REPLACE INTO meta(k,v) VALUES ('rules_canonical', ?1)",
+-            params![rules],
+-        )
+-        .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
++        let existing: Option<Vec<u8>> = db
++            .query_row(
++                "SELECT v FROM meta WHERE k='rules_canonical'",
++                [],
++                |r| r.get(0),
++            )
++            .optional()
++            .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
++        match existing {
++            Some(old) if old != rules => {
++                return Err(SimError::ArchiveFailure(
++                    "archive rules_canonical does not match opened RuleSpec".into(),
++                ));
++            }
++            Some(_) => {}
++            None => {
++                db.execute(
++                    "INSERT INTO meta(k,v) VALUES ('rules_canonical', ?1)",
++                    params![rules],
++                )
++                .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
++            }
++        }
+         Ok(Self {
+             dir,
+             db,
+@@ -94,6 +115,7 @@ impl Archive {
+             snap_every: spec.archive.checkpoint_every_ticks.max(1),
+             last_batch_tick: 0,
+             fail_before_rename: false,
++            fail_event_after: None,
+         })
+     }
+ 
+@@ -156,19 +178,52 @@ impl Archive {
+         events: &[LifeEvent],
+     ) -> Result<(), SimError> {
+         let live = state.tick;
+-        self.set_u64("live_tick", live)?;
+-        for e in events {
++        let tx = self
++            .db
++            .unchecked_transaction()
++            .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
++        tx.execute(
++            "INSERT OR REPLACE INTO meta(k,v) VALUES ('live_tick', ?1)",
++            params![live.to_le_bytes().as_slice()],
++        )
++        .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
++        for (i, e) in events.iter().enumerate() {
++            if let Some(limit) = self.fail_event_after {
++                if i >= limit {
++                    return Err(SimError::ArchiveFailure("injected event insert failure".into()));
++                }
++            }
+             let row_bytes = 40u64;
+             if self.pending_bytes.saturating_add(row_bytes) > self.max_unwritten {
+                 return Err(SimError::SafetyPause(
+                     "unwritten archive buffer exceeds 256 MiB".into(),
+                 ));
+             }
+-            self.db
+-                .execute(
+-                    "INSERT INTO events(tick,kind,a,b,amount) VALUES (?1,?2,?3,?4,?5)",
++            let existing: Option<(i64, i64, i64, i64, i64)> = tx
++                .query_row(
++                    "SELECT tick, kind, a, b, amount FROM events WHERE tick=?1 AND local_index=?2",
++                    params![e.tick as i64, i as i64],
++                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
++                )
++                .optional()
++                .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
++            if let Some((tick, kind, a, b, amount)) = existing {
++                if tick != e.tick as i64
++                    || kind != e.kind.code() as i64
++                    || a != e.entity_a as i64
++                    || b != e.entity_b as i64
++                    || amount != e.amount as i64
++                {
++                    return Err(SimError::ArchiveFailure(
++                        "idempotent event replay mismatch".into(),
++                    ));
++                }
++            } else {
++                tx.execute(
++                    "INSERT INTO events(tick,local_index,kind,a,b,amount) VALUES (?1,?2,?3,?4,?5,?6)",
+                     params![
+                         e.tick as i64,
++                        i as i64,
+                         e.kind.code() as i64,
+                         e.entity_a as i64,
+                         e.entity_b as i64,
+@@ -176,10 +231,13 @@ impl Archive {
+                     ],
+                 )
+                 .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
++            }
+             self.pending_bytes += row_bytes;
+         }
++        tx.commit()
++            .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+         if live > 0 && live % self.hash_every == 0 {
+-            self.close_batch(state, events.len())?;
++            self.close_batch(state)?;
+         }
+         if live > 0 && live % self.snap_every == 0 {
+             self.write_snapshot(state)?;
+@@ -187,14 +245,32 @@ impl Archive {
+         Ok(())
+     }
+ 
++    /// Write and register S0 or any committed boundary, including tick 0.
++    pub fn checkpoint_boundary(&mut self, state: &WorldState) -> Result<(), SimError> {
++        self.write_snapshot(state)
++    }
++
++    pub fn record_initial(&mut self, state: &WorldState) -> Result<(), SimError> {
++        self.checkpoint_boundary(state)?;
++        self.set_u64("live_tick", state.tick)
++    }
++
+     pub fn flush_exit(&mut self, state: &WorldState) -> Result<(), SimError> {
+-        self.close_batch(state, 0)?;
++        self.close_batch(state)?;
+         Ok(())
+     }
+ 
+-    fn close_batch(&mut self, state: &WorldState, extra_events: usize) -> Result<(), SimError> {
++    fn close_batch(&mut self, state: &WorldState) -> Result<(), SimError> {
+         let h = state_hash(state).map_err(SimError::from)?;
+         let tick = state.tick;
++        let event_count: i64 = self
++            .db
++            .query_row(
++                "SELECT COUNT(*) FROM events WHERE tick >= ?1 AND tick < ?2",
++                params![self.last_batch_tick as i64, tick as i64],
++                |r| r.get(0),
++            )
++            .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+         let tx = self
+             .db
+             .unchecked_transaction()
+@@ -206,7 +282,7 @@ impl Archive {
+         .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+         tx.execute(
+             "INSERT OR REPLACE INTO batches(end_tick, state_hash, event_count) VALUES (?1,?2,?3)",
+-            params![tick as i64, h.as_slice(), extra_events as i64],
++            params![tick as i64, h.as_slice(), event_count],
+         )
+         .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+         tx.execute(
+@@ -340,7 +416,7 @@ impl Archive {
+         let mut stmt = self
+             .db
+             .prepare(
+-                "SELECT tick, kind, a, b, amount FROM events WHERE tick >= ?1 AND tick < ?2 ORDER BY id",
++                "SELECT tick, kind, a, b, amount FROM events WHERE tick >= ?1 AND tick < ?2 ORDER BY tick, local_index",
+             )
+             .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+         let rows = stmt
+@@ -512,4 +588,103 @@ mod tests {
+         assert_eq!(n, 0);
+         let _ = std::fs::remove_dir_all(&dir);
+     }
++
++    #[test]
++    fn s0_restores_before_periodic_snapshot() {
++        let spec = RuleSpec::eu_core_1();
++        let dir = std::env::temp_dir().join(format!(
++            "eu-arch-s0-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        let mut arch = Archive::open(&dir, &spec).unwrap();
++        let st = WorldState::empty(&spec, 7).unwrap();
++        arch.record_initial(&st).unwrap();
++        let found = arch.latest_snapshot_tick(3).unwrap().expect("S0");
++        assert_eq!(found.0, 0);
++        let loaded = Archive::load_snapshot_file(&found.1, Some(found.2)).unwrap();
++        assert_eq!(state_hash(&st).unwrap(), state_hash(&loaded).unwrap());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn event_retry_is_idempotent() {
++        let spec = RuleSpec::eu_core_1();
++        let dir = std::env::temp_dir().join(format!(
++            "eu-arch-evt-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        let mut arch = Archive::open(&dir, &spec).unwrap();
++        let mut st = WorldState::empty(&spec, 1).unwrap();
++        st.tick = 1;
++        let events = [
++            LifeEvent {
++                tick: 0,
++                kind: LifeEventKind::Death,
++                entity_a: 1,
++                entity_b: 0,
++                amount: 3,
++            },
++            LifeEvent {
++                tick: 0,
++                kind: LifeEventKind::EmbryoCancel,
++                entity_a: 1,
++                entity_b: 0,
++                amount: 4,
++            },
++        ];
++        arch.fail_event_after = Some(1);
++        let err = arch.record_committed(&st, &events).unwrap_err();
++        match err {
++            SimError::ArchiveFailure(msg) => assert!(msg.contains("event insert")),
++            other => panic!("{other:?}"),
++        }
++        let n0: i64 = arch
++            .db
++            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
++            .unwrap();
++        assert_eq!(n0, 0);
++        arch.fail_event_after = None;
++        arch.record_committed(&st, &events).unwrap();
++        arch.record_committed(&st, &events).unwrap();
++        let n: i64 = arch
++            .db
++            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
++            .unwrap();
++        assert_eq!(n, 2);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn open_rejects_rules_mismatch() {
++        let spec = RuleSpec::eu_core_1();
++        let dir = std::env::temp_dir().join(format!(
++            "eu-arch-rules-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        let _arch = Archive::open(&dir, &spec).unwrap();
++        drop(_arch);
++        let mut spec2 = spec.clone();
++        spec2.lighting.radiation_input_per_cell = spec.lighting.radiation_input_per_cell + 1;
++        let err = match Archive::open(&dir, &spec2) {
++            Ok(_) => panic!("expected rules mismatch"),
++            Err(e) => e,
++        };
++        match err {
++            SimError::ArchiveFailure(msg) => assert!(msg.contains("rules_canonical")),
++            other => panic!("{other:?}"),
++        }
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+ }
+diff --git a/crates/universe_core/src/brain.rs b/crates/universe_core/src/brain.rs
+index 0c467ad..44cb9e9 100644
+--- a/crates/universe_core/src/brain.rs
++++ b/crates/universe_core/src/brain.rs
+@@ -426,8 +426,6 @@ pub fn decide(
+     org.control.metab_boost = hs.binary[3];
+     org.control.repair = hs.binary[4];
+     org.control.reproduce = hs.binary[5] && allow_repro;
+-    org.last_feedback = org.feedback;
+-    org.feedback = universe_types::IntervalFeedback::default();
+     org.brain.has_pending = true;
+     reset_interval(&mut org.brain);
+ 
+@@ -453,6 +451,10 @@ pub fn decide(
+             trace_a += org.brain.e_a[i][j] * org.brain.e_a[i][j];
+         }
+     }
++    let mut v_norm = 0.0;
++    for j in 0..PHI {
++        v_norm += org.brain.v[j] * org.brain.v[j];
++    }
+     let mut entropy = entropy_cat(hs.p_thr) + entropy_cat(hs.p_turn);
+     for h in 0..10 {
+         let p = hs.p_bin[h];
+@@ -478,10 +480,19 @@ pub fn decide(
+         da_feat_abs: da_feat,
+         v_prev: stats.v_prev,
+         v_next: stats.v_next,
++        v_norm: libm::sqrt(v_norm),
+         intent_thrust: hs.thrust,
+         intent_turn: hs.turn,
++        binary_intent: hs.binary,
++        p_thr: hs.p_thr,
++        p_turn: hs.p_turn,
++        p_bin: hs.p_bin,
+         paid_thrust: org.control.thrust,
+         paid_turn: org.control.turn,
++        h_before,
++        h_after: h_next,
++        phi: phi_next,
++        ..crate::probe::DecisionDiag::default()
+     })
+ }
+ 
+diff --git a/crates/universe_core/src/d2_tests.rs b/crates/universe_core/src/d2_tests.rs
+new file mode 100644
+index 0000000..364500e
+--- /dev/null
++++ b/crates/universe_core/src/d2_tests.rs
+@@ -0,0 +1,415 @@
++//! D2 world-level regressions. These fail on 4f237b0 (late feedback, double
++//! motion normalization, no readout-update fault path).
++
++use super::*;
++use crate::physics::tick_dt;
++use crate::probe::{ControlMode, FaultPoint};
++use universe_types::{
++    rules_hash, state_hash, FutureInput, NumericFault, RuleSpec, SimError,
++};
++
++fn reversal_spec() -> RuleSpec {
++    let mut spec = RuleSpec::eu_core_1();
++    spec.world.grid_width = 16;
++    spec.world.grid_height = 16;
++    spec.world.width_lu = 16.0;
++    spec.world.height_lu = 16.0;
++    spec.lighting.left_x0 = 3;
++    spec.lighting.left_x1 = 5;
++    spec.lighting.right_x0 = 3;
++    spec.lighting.right_x1 = 5;
++    spec.lighting.y0 = 7;
++    spec.lighting.y1 = 9;
++    spec.init.initial_count = 1;
++    spec.validate_lab().expect("lab spec");
++    spec
++}
++
++fn lamp_world(seed: u64, mode: ControlMode) -> World {
++    let spec = reversal_spec();
++    let mut st = initialize_reversal_world(&spec, seed).unwrap();
++    st.organisms[0].geom.x = 4.5;
++    st.organisms[0].geom.y = 8.5;
++    st.organisms[0].geom.theta = 0.0;
++    let mut w = World::from_state(spec, st);
++    w.disable_reproduction = true;
++    w.freeze_learning = true;
++    w.control_mode = mode;
++    w.enable_probe = true;
++    w
++}
++
++fn diag_at(w: &World, tick: u64) -> &crate::probe::DecisionDiag {
++    w.last_decisions
++        .iter()
++        .find(|d| d.tick == tick)
++        .unwrap_or_else(|| panic!("missing decision at tick {tick}"))
++}
++
++/// FB01: after steps 0鈥?, the tick=5 neural input must contain [0,5) photo.
++#[test]
++fn fb01_first_complete_feedback_on_decision() {
++    let mut w = lamp_world(11, ControlMode::Stationary);
++    for _ in 0..6 {
++        w.step().unwrap();
++    }
++    assert_eq!(w.state.tick, 6);
++    let d0 = diag_at(&w, 0);
++    assert_eq!(d0.feedback_ticks, 0, "first decision has no prior interval");
++    assert!(d0.obs[32 + 31] < 0.5, "first-decision photo valid bit must be 0");
++
++    let d5 = diag_at(&w, 5);
++    assert_eq!(d5.feedback_start_tick, 0);
++    assert_eq!(d5.feedback_end_tick, 5);
++    assert_eq!(d5.feedback_ticks, 5);
++    assert_eq!(d5.observation_state_tick, 5);
++    assert!(
++        d5.obs[32 + 31] > 0.5,
++        "tick=5 must read sealed [0,5) photo valid=1, got valid={}",
++        d5.obs[32 + 31]
++    );
++    assert!(
++        d5.obs[31] > 0.0,
++        "tick=5 photo channel must be >0 under the lamp, got {}",
++        d5.obs[31]
++    );
++    assert!(
++        d5.actual_forward_displacement.abs() < 1e-9,
++        "stationary interval must not report paid-control as motion"
++    );
++}
++
++/// FB02: tick=10 reads [5,10), not the previous [0,5) photo.
++#[test]
++fn fb02_interval_switches() {
++    let mut w = lamp_world(11, ControlMode::Stationary);
++    for _ in 0..6 {
++        w.step().unwrap();
++    }
++    let photo_05 = diag_at(&w, 5).obs[31];
++    assert!(photo_05 > 0.0);
++    w.state.organisms[0].geom.x = 0.4;
++    w.state.organisms[0].geom.y = 0.4;
++    for _ in 0..5 {
++        w.step().unwrap();
++    }
++    let d10 = diag_at(&w, 10);
++    assert_eq!(d10.feedback_start_tick, 5);
++    assert_eq!(d10.feedback_end_tick, 10);
++    assert_eq!(d10.feedback_ticks, 5);
++    assert!(
++        d10.obs[31] + 1e-9 < photo_05,
++        "tick=10 must not reuse [0,5) photo {} vs {}",
++        d10.obs[31],
++        photo_05
++    );
++}
++
++/// FB03: a skipped decision stretches interval_d; recovery updates once.
++#[test]
++fn fb03_skipped_decision_consumes_once() {
++    let mut w = lamp_world(11, ControlMode::Neural);
++    w.freeze_learning = false;
++    for _ in 0..5 {
++        w.step().unwrap();
++    }
++    assert_eq!(w.state.tick, 5);
++    let maint = maintenance_cost(&w.state.organisms[0], &w.spec, false);
++    w.state.organisms[0].accounts.e_old = maint + 100;
++    w.state.organisms[0].accounts.e_new = 0;
++    w.step().unwrap();
++    assert_eq!(w.state.tick, 6);
++    assert!(
++        w.last_skips.iter().any(|s| s.tick == 5),
++        "tick 5 must be recorded as a skipped decision, skips={:?}",
++        w.last_skips
++            .iter()
++            .map(|s| (s.tick, s.reason.clone()))
++            .collect::<Vec<_>>()
++    );
++    assert!(
++        w.last_decisions.iter().all(|d| d.tick != 5),
++        "skipped tick must not consume the learning interval"
++    );
++    w.state.organisms[0].accounts.e_old = 8_000_000;
++    for _ in 0..5 {
++        w.step().unwrap();
++    }
++    let d10 = diag_at(&w, 10);
++    assert_eq!(d10.interval_d, 10, "open interval must span the skipped boundary");
++    assert_eq!(d10.feedback_ticks, 10);
++    let updates: Vec<u64> = w
++        .last_decisions
++        .iter()
++        .filter(|d| d.applied_update)
++        .map(|d| d.tick)
++        .collect();
++    assert_eq!(updates, vec![10], "readout must fire once after the skip, got {updates:?}");
++}
++
++/// FB04: Neural and Reflex receive the same observation bytes and interval.
++#[test]
++fn fb04_same_frame_neural_and_reflex() {
++    let mut base = lamp_world(11, ControlMode::Stationary);
++    for _ in 0..5 {
++        base.step().unwrap();
++    }
++    let bytes = base.state.encode_canonical().unwrap();
++    let restored = universe_types::WorldState::decode_canonical(&bytes).unwrap();
++    let mut neural = World::from_state(base.spec.clone(), restored.clone());
++    neural.disable_reproduction = true;
++    neural.freeze_learning = true;
++    neural.control_mode = ControlMode::Neural;
++    neural.enable_probe = true;
++    let mut reflex = World::from_state(base.spec.clone(), restored);
++    reflex.disable_reproduction = true;
++    reflex.freeze_learning = true;
++    reflex.control_mode = ControlMode::ReflexQ;
++    reflex.enable_probe = true;
++    neural.step().unwrap();
++    reflex.step().unwrap();
++    let fn_ = neural.last_observation.get(&1).expect("neural frame");
++    let fr = reflex.last_observation.get(&1).expect("reflex frame");
++    assert_eq!(fn_.feedback_start_tick, fr.feedback_start_tick);
++    assert_eq!(fn_.feedback_end_tick, fr.feedback_end_tick);
++    assert_eq!(fn_.feedback_ticks, fr.feedback_ticks);
++    assert_eq!(fn_.obs, fr.obs);
++}
++
++/// MV01: full-speed free motion normalizes to ~1 after a sealed interval.
++#[test]
++fn mv01_open_field_full_thrust() {
++    let spec = reversal_spec();
++    let mut st = initialize_reversal_world(&spec, 9).unwrap();
++    st.organisms[0].geom.x = 8.0;
++    st.organisms[0].geom.y = 8.0;
++    st.organisms[0].geom.theta = 0.0;
++    st.organisms[0].accounts.e_old = 8_000_000;
++    let mut w = World::from_state(spec, st);
++    w.disable_reproduction = true;
++    w.freeze_learning = true;
++    w.control_mode = ControlMode::Forced {
++        thrust: 1,
++        turn: 0,
++    };
++    w.enable_probe = true;
++    for _ in 0..6 {
++        w.step().unwrap();
++    }
++    let d5 = diag_at(&w, 5);
++    assert!((d5.u_effective - 1.0).abs() < 1e-12);
++    let dur = tick_dt(&w.spec) * d5.feedback_ticks as f64;
++    let speed = d5.actual_forward_displacement / dur;
++    let norm = speed / w.spec.physics.max_linear_speed;
++    assert!(
++        (norm - 1.0).abs() < 0.05,
++        "expected ~1 forward sense, got {norm} disp={} dur={dur}",
++        d5.actual_forward_displacement
++    );
++    assert!((d5.obs[28] - 1.0).abs() < 0.05, "obs[28]={}", d5.obs[28]);
++}
++
++/// MV02: wall contact: paid thrust stays 1, actual forward ~ 0.
++#[test]
++fn mv02_wall_paid_but_no_progress() {
++    let spec = reversal_spec();
++    let mut st = initialize_reversal_world(&spec, 9).unwrap();
++    st.organisms[0].geom.x = 0.3;
++    st.organisms[0].geom.y = 8.0;
++    st.organisms[0].geom.theta = std::f64::consts::PI;
++    st.organisms[0].accounts.e_old = 8_000_000;
++    let mut w = World::from_state(spec, st);
++    w.disable_reproduction = true;
++    w.freeze_learning = true;
++    w.control_mode = ControlMode::Forced {
++        thrust: 1,
++        turn: 0,
++    };
++    w.enable_probe = true;
++    for _ in 0..6 {
++        w.step().unwrap();
++    }
++    let d5 = diag_at(&w, 5);
++    assert!((d5.u_effective - 1.0).abs() < 1e-12);
++    assert!(d5.paid_motion_energy > 0);
++    let dur = tick_dt(&w.spec) * d5.feedback_ticks as f64;
++    let norm = (d5.actual_forward_displacement / dur) / w.spec.physics.max_linear_speed;
++    assert!(
++        norm.abs() < 0.05,
++        "wall should zero actual forward, got {norm} disp={}",
++        d5.actual_forward_displacement
++    );
++    assert!(d5.obs[28].abs() < 0.05, "obs[28]={}", d5.obs[28]);
++}
++
++/// MV03: full turn across 卤蟺 stays ~卤1 with no 2蟺 jump in last_dtheta.
++#[test]
++fn mv03_full_turn_unwraps() {
++    let spec = reversal_spec();
++    let mut st = initialize_reversal_world(&spec, 9).unwrap();
++    st.organisms[0].geom.x = 8.0;
++    st.organisms[0].geom.y = 8.0;
++    st.organisms[0].geom.theta = std::f64::consts::PI - 0.05;
++    st.organisms[0].accounts.e_old = 8_000_000;
++    let mut w = World::from_state(spec, st);
++    w.disable_reproduction = true;
++    w.freeze_learning = true;
++    w.control_mode = ControlMode::Forced {
++        thrust: 0,
++        turn: 1,
++    };
++    w.enable_probe = true;
++    let mut sum = 0.0;
++    for _ in 0..12 {
++        w.step().unwrap();
++        let dth = w.state.organisms[0].last_dtheta;
++        assert!(
++            dth > 0.0 && dth < 1.0,
++            "unwrapped dtheta jumped: {dth} theta={}",
++            w.state.organisms[0].geom.theta
++        );
++        sum += dth;
++    }
++    let d5 = diag_at(&w, 5);
++    assert!((d5.w_effective - 1.0).abs() < 1e-12);
++    assert!((d5.obs[29] - 1.0).abs() < 0.05, "obs[29]={}", d5.obs[29]);
++    let expect = 12.0 * tick_dt(&w.spec) * w.spec.physics.max_angular_speed;
++    assert!((sum - expect).abs() < 1e-6, "sum={sum} expect={expect}");
++}
++
++/// MV04: P3 partial pay is logged as 0.5, e_new unused.
++#[test]
++fn mv04_partial_pay_logged() {
++    let spec = reversal_spec();
++    let mut st = initialize_reversal_world(&spec, 1).unwrap();
++    st.organisms[0].geom.x = 8.0;
++    st.organisms[0].geom.y = 8.0;
++    let mut w = World::from_state(spec, st);
++    w.disable_reproduction = true;
++    w.freeze_learning = true;
++    w.control_mode = ControlMode::Forced {
++        thrust: 1,
++        turn: 1,
++    };
++    w.enable_probe = true;
++    for _ in 0..5 {
++        w.step().unwrap();
++    }
++    let maint = maintenance_cost(&w.state.organisms[0], &w.spec, false);
++    let cog = w.spec.cognition_cost_b();
++    w.state.organisms[0].accounts.e_old = maint + cog + 600;
++    w.state.organisms[0].accounts.e_new = 50_000;
++    w.step().unwrap();
++    let d5 = diag_at(&w, 5);
++    assert!((d5.u_effective - 0.5).abs() < 1e-12, "u_eff={}", d5.u_effective);
++    assert!((d5.w_effective - 0.5).abs() < 1e-12, "w_eff={}", d5.w_effective);
++    assert_eq!(d5.paid_motion_energy, 600);
++}
++
++/// AT01: pending readout actually changes A/v; AfterP2 inject restores bytes.
++#[test]
++fn at01_readout_update_then_injected_fault_restores() {
++    let spec = reversal_spec();
++    let st = initialize_reversal_world(&spec, 21).unwrap();
++    let a0 = st.organisms[0].brain.a;
++    let v0 = st.organisms[0].brain.v;
++    let mut live = World::from_state(spec.clone(), st.clone());
++    live.disable_reproduction = true;
++    live.freeze_learning = false;
++    live.control_mode = ControlMode::Neural;
++    live.enable_probe = true;
++    for _ in 0..5 {
++        live.step().unwrap();
++    }
++    assert!(live.state.organisms[0].brain.has_pending);
++    let (b0, h0) = (
++        live.state.encode_canonical().unwrap(),
++        state_hash(&live.state).unwrap(),
++    );
++    let mut injected = live.clone();
++    injected.inject_fault = Some(FaultPoint::AfterP2);
++    match injected.step().unwrap_err() {
++        SimError::Numeric(NumericFault::Overflow(tag)) => assert_eq!(tag, "inject_p2"),
++        other => panic!("{other:?}"),
++    }
++    assert_eq!(injected.state.encode_canonical().unwrap(), b0);
++    assert_eq!(state_hash(&injected.state).unwrap(), h0);
++    assert!(injected.last_events.is_empty());
++
++    let mut reference = live.clone();
++    injected.inject_fault = None;
++    injected.step().unwrap();
++    reference.step().unwrap();
++    assert_eq!(
++        state_hash(&injected.state).unwrap(),
++        state_hash(&reference.state).unwrap()
++    );
++    assert!(
++        injected.last_decisions.iter().any(|d| d.tick == 5 && d.applied_update),
++        "tick=5 must apply a readout update"
++    );
++    let changed_a = injected.state.organisms[0].brain.a != a0;
++    let changed_v = injected.state.organisms[0].brain.v != v0;
++    assert!(changed_a || changed_v, "A/v must move on the uninjected path");
++}
++
++#[test]
++fn ex03_nonempty_future_inputs_rejected() {
++    let spec = reversal_spec();
++    let mut st = initialize_reversal_world(&spec, 3).unwrap();
++    st.future_inputs.push(FutureInput {
++        effective_tick: 0,
++        seq: 0,
++        kind: 1,
++        payload: vec![1],
++    });
++    let mut w = World::from_state(spec, st);
++    match w.step().unwrap_err() {
++        SimError::ExperimentSetup(msg) => assert!(msg.contains("future_inputs")),
++        other => panic!("{other:?}"),
++    }
++}
++
++#[test]
++fn low_stock_retargets_m0_u0() {
++    let spec = reversal_spec();
++    let mut st = initialize_reversal_world(&spec, 3).unwrap();
++    let u0 = st.audit.initial_u;
++    st.organisms[0].accounts.c = 2_000;
++    retarget_audit_baseline(&mut st, &spec).unwrap();
++    let mu = compute_mu(&st, spec.reactions.chem_e_per_organic).unwrap();
++    assert_eq!(st.audit.initial_u, mu.u);
++    assert_eq!(st.audit.initial_m, mu.m);
++    assert_ne!(st.audit.initial_u, u0);
++}
++
++#[test]
++fn lighting_change_syncs_rules_hash() {
++    let spec = reversal_spec();
++    let h0 = rules_hash(&spec).unwrap();
++    let st = initialize_reversal_world(&spec, 3).unwrap();
++    let mut w = World::from_state(spec, st);
++    assert_eq!(w.state.rules_hash, h0);
++    let mut lit = w.spec.lighting.clone();
++    lit.left_x0 = 10;
++    lit.left_x1 = 12;
++    lit.right_x0 = 10;
++    lit.right_x1 = 12;
++    w.apply_lighting(lit).unwrap();
++    let h1 = rules_hash(&w.spec).unwrap();
++    assert_ne!(h0, h1);
++    assert_eq!(w.state.rules_hash, h1);
++}
++
++#[test]
++fn p0_energy_not_post_maintenance() {
++    let mut w = lamp_world(11, ControlMode::Stationary);
++    let e0 = w.state.organisms[0].accounts.e_old;
++    let emax = w.state.organisms[0].e_max;
++    w.step().unwrap();
++    let frame = w.last_observation.get(&1).expect("frame");
++    assert_eq!(frame.p0_e_old, e0);
++    let want = (e0 as f64 / emax as f64).clamp(0.0, 1.0);
++    assert!((frame.obs[20] - want).abs() < 1e-12);
++    assert!(w.last_probe.maint_paid + w.last_probe.cognition > 0);
++}
+diff --git a/crates/universe_core/src/init.rs b/crates/universe_core/src/init.rs
+index 96356a1..b12dcbe 100644
+--- a/crates/universe_core/src/init.rs
++++ b/crates/universe_core/src/init.rs
+@@ -153,3 +153,11 @@ pub fn initialize_reversal_world(spec: &RuleSpec, root_seed: u64) -> Result<Worl
+     state.sort_authoritative();
+     Ok(state)
+ }
++
++/// Recompute M0/U0 after a public experimental initial-state edit.
++pub fn retarget_audit_baseline(state: &mut WorldState, spec: &RuleSpec) -> Result<(), NumericFault> {
++    let mu = compute_mu(state, spec.reactions.chem_e_per_organic)?;
++    state.audit.initial_m = mu.m;
++    state.audit.initial_u = mu.u;
++    Ok(())
++}
+diff --git a/crates/universe_core/src/lib.rs b/crates/universe_core/src/lib.rs
+index a2f91a8..64be591 100644
+--- a/crates/universe_core/src/lib.rs
++++ b/crates/universe_core/src/lib.rs
+@@ -18,13 +18,17 @@ pub mod world;
+ 
+ pub use audit::{compute_mu, energy_identity_holds, MuTotals};
+ pub use fields::{decay_s_q, phase_p5a, transport_all_fields, transport_deltas};
+-pub use init::{initialize_reversal_world, initialize_world, lighting_cells, lighting_centroid};
++pub use init::{
++    initialize_reversal_world, initialize_world, lighting_cells, lighting_centroid,
++    retarget_audit_baseline,
++};
+ pub use physiology::{
+     attempt_motion_cost, is_irrecoverable, maintenance_cost, pay_maintenance, pay_maintenance_parts,
+     scale_control, scale_control_parts, MaintPay, MotionPay,
+ };
+ pub use probe::{
+-    budget_p, ControlMode, DecisionDiag, FaultPoint, RunLedger, TickProbe,
++    aggregate_decisions, budget_p, ControlMode, DecisionAggregate, DecisionDiag, DecisionSkip,
++    FaultPoint, ObservationFrame, RunLedger, TickProbe,
+ };
+ pub use ledger::{
+     catabolism, commit_e_new_into_old, n_uptake, o_uptake, photosynth, repair, spend_old_energy,
+@@ -675,3 +679,5 @@ mod g4_tests {
+ 
+ #[cfg(test)]
+ mod d1_tests;
++#[cfg(test)]
++mod d2_tests;
+diff --git a/crates/universe_core/src/physics.rs b/crates/universe_core/src/physics.rs
+index 9a08c54..e500d49 100644
+--- a/crates/universe_core/src/physics.rs
++++ b/crates/universe_core/src/physics.rs
+@@ -3,6 +3,18 @@
+ use crate::rng::{geometry_draw_index, random_u32};
+ use universe_types::{NumericFault, RuleSpec, WorldState, RngDomain};
+ 
++/// Duration of one physical tick, seconds.
++pub fn tick_dt(spec: &RuleSpec) -> f64 {
++    let den = spec.time.dt_denominator.max(1);
++    spec.time.dt_numerator as f64 / den as f64
++}
++
++/// Duration of one physics substep, seconds.
++pub fn substep_dt(spec: &RuleSpec) -> f64 {
++    let nsub = spec.physics.substeps.max(1);
++    tick_dt(spec) / f64::from(nsub)
++}
++
+ pub fn wrap_angle(mut theta: f64) -> f64 {
+     let pi = std::f64::consts::PI;
+     let two_pi = 2.0 * pi;
+@@ -54,7 +66,7 @@ pub fn integrate_substep(
+     w_eff: f64,
+     spec: &RuleSpec,
+ ) -> (f64, f64, f64) {
+-    let dt = 0.025;
++    let dt = substep_dt(spec);
+     let omega = w_eff * spec.physics.max_angular_speed;
+     let v = u_eff * spec.physics.max_linear_speed;
+     let theta2 = wrap_angle(theta + omega * dt);
+@@ -235,29 +247,42 @@ pub fn solve_contacts(
+ 
+ pub fn physics_substeps(state: &mut WorldState, spec: &RuleSpec) -> Result<(), NumericFault> {
+     let nsub = spec.physics.substeps;
++    let dt = substep_dt(spec);
+     for s in 0..nsub {
++        let mut starts = Vec::with_capacity(state.organisms.len());
+         for org in &mut state.organisms {
+             if org.marked_dead {
++                starts.push(None);
+                 continue;
+             }
+-            let (x, y, th) = integrate_substep(
+-                org.geom.x,
+-                org.geom.y,
+-                org.geom.theta,
+-                org.control.u_effective,
+-                org.control.w_effective,
+-                spec,
+-            );
+-            org.last_dx += x - org.geom.x;
+-            org.last_dy += y - org.geom.y;
+-            org.last_dtheta += th - org.geom.theta;
+-            org.geom.x = x;
+-            org.geom.y = y;
+-            org.geom.theta = th;
++            let x0 = org.geom.x;
++            let y0 = org.geom.y;
++            let omega = org.control.w_effective * spec.physics.max_angular_speed;
++            let v = org.control.u_effective * spec.physics.max_linear_speed;
++            let dtheta = omega * dt;
++            let th2 = wrap_angle(org.geom.theta + dtheta);
++            org.geom.x = x0 + v * dt * libm::cos(th2);
++            org.geom.y = y0 + v * dt * libm::sin(th2);
++            org.geom.theta = th2;
++            starts.push(Some((x0, y0, dtheta, th2)));
+         }
+         solve_contacts(state, spec, s)?;
+-        for org in &mut state.organisms {
++        for (org, start) in state.organisms.iter_mut().zip(starts.into_iter()) {
+             org.geom.theta = wrap_angle(org.geom.theta);
++            let Some((x0, y0, dtheta, heading)) = start else {
++                continue;
++            };
++            if org.marked_dead {
++                continue;
++            }
++            let dx = org.geom.x - x0;
++            let dy = org.geom.y - y0;
++            let forward = dx * libm::cos(heading) + dy * libm::sin(heading);
++            org.last_dx += dx;
++            org.last_dy += dy;
++            org.last_dtheta += dtheta;
++            org.feedback.thrust_sum += forward;
++            org.feedback.turn_sum += dtheta;
+         }
+     }
+     Ok(())
+diff --git a/crates/universe_core/src/probe.rs b/crates/universe_core/src/probe.rs
+index 317a5e0..c09541c 100644
+--- a/crates/universe_core/src/probe.rs
++++ b/crates/universe_core/src/probe.rs
+@@ -103,10 +103,56 @@ impl RunLedger {
+     }
+ }
+ 
++#[derive(Clone, Debug)]
++pub struct ObservationFrame {
++    pub entity_id: u64,
++    pub observation_state_tick: u64,
++    pub feedback_start_tick: u64,
++    pub feedback_end_tick: u64,
++    pub feedback_ticks: u64,
++    pub obs: [f64; universe_types::INPUTS],
++    pub p0_e_old: u64,
++    pub p0_c: u64,
++}
++
++impl Default for ObservationFrame {
++    fn default() -> Self {
++        Self {
++            entity_id: 0,
++            observation_state_tick: 0,
++            feedback_start_tick: 0,
++            feedback_end_tick: 0,
++            feedback_ticks: 0,
++            obs: [0.0; universe_types::INPUTS],
++            p0_e_old: 0,
++            p0_c: 0,
++        }
++    }
++}
++
++impl ObservationFrame {
++    pub fn obs_valid(&self, i: usize) -> bool {
++        i < 32 && self.obs[32 + i] > 0.5
++    }
++}
++
+ #[derive(Clone, Debug, Default)]
++pub struct DecisionSkip {
++    pub tick: u64,
++    pub entity_id: u64,
++    pub reason: String,
++    pub e_old: u64,
++    pub open_feedback_ticks: u64,
++}
++
++#[derive(Clone, Debug)]
+ pub struct DecisionDiag {
+     pub tick: u64,
+     pub entity_id: u64,
++    pub observation_state_tick: u64,
++    pub feedback_start_tick: u64,
++    pub feedback_end_tick: u64,
++    pub feedback_ticks: u64,
+     pub applied_update: bool,
+     pub interval_d: u64,
+     pub r: f64,
+@@ -122,10 +168,142 @@ pub struct DecisionDiag {
+     pub da_feat_abs: f64,
+     pub v_prev: f64,
+     pub v_next: f64,
++    pub v_norm: f64,
+     pub intent_thrust: i8,
+     pub intent_turn: i8,
++    pub binary_intent: [bool; 10],
++    pub p_thr: [f64; 3],
++    pub p_turn: [f64; 3],
++    pub p_bin: [f64; 10],
+     pub paid_thrust: i8,
+     pub paid_turn: i8,
++    pub u_effective: f64,
++    pub w_effective: f64,
++    pub paid_motion_energy: u64,
++    pub actual_forward_displacement: f64,
++    pub actual_unwrapped_turn: f64,
++    pub obs: [f64; universe_types::INPUTS],
++    pub h_before: [f64; universe_types::HIDDEN],
++    pub h_after: [f64; universe_types::HIDDEN],
++    pub phi: [f64; universe_types::PHI],
++    pub actor_task_gradient_norm: f64,
++    pub entropy_term_norm: f64,
++    pub baseline_term_norm: f64,
++    pub trace_norm_before_projection: f64,
++    pub trace_norm_after_projection: f64,
++    pub update_norm_before_projection: f64,
++    pub update_norm_after_projection: f64,
++}
++
++impl Default for DecisionDiag {
++    fn default() -> Self {
++        Self {
++            tick: 0,
++            entity_id: 0,
++            observation_state_tick: 0,
++            feedback_start_tick: 0,
++            feedback_end_tick: 0,
++            feedback_ticks: 0,
++            applied_update: false,
++            interval_d: 0,
++            r: 0.0,
++            delta: 0.0,
++            delta_used: 0.0,
++            clipped: false,
++            entropy: 0.0,
++            a_minus_a0_frob: 0.0,
++            trace_a_frob: 0.0,
++            h_l2_delta: 0.0,
++            input_change: 0.0,
++            da_bias_abs: 0.0,
++            da_feat_abs: 0.0,
++            v_prev: 0.0,
++            v_next: 0.0,
++            v_norm: 0.0,
++            intent_thrust: 0,
++            intent_turn: 0,
++            binary_intent: [false; 10],
++            p_thr: [0.0; 3],
++            p_turn: [0.0; 3],
++            p_bin: [0.0; 10],
++            paid_thrust: 0,
++            paid_turn: 0,
++            u_effective: 0.0,
++            w_effective: 0.0,
++            paid_motion_energy: 0,
++            actual_forward_displacement: 0.0,
++            actual_unwrapped_turn: 0.0,
++            obs: [0.0; universe_types::INPUTS],
++            h_before: [0.0; universe_types::HIDDEN],
++            h_after: [0.0; universe_types::HIDDEN],
++            phi: [0.0; universe_types::PHI],
++            actor_task_gradient_norm: 0.0,
++            entropy_term_norm: 0.0,
++            baseline_term_norm: 0.0,
++            trace_norm_before_projection: 0.0,
++            trace_norm_after_projection: 0.0,
++            update_norm_before_projection: 0.0,
++            update_norm_after_projection: 0.0,
++        }
++    }
++}
++
++#[derive(Clone, Debug, Default)]
++pub struct DecisionAggregate {
++    pub n: u64,
++    pub n_updates: u64,
++    pub n_clipped: u64,
++    pub mean_delta: f64,
++    pub mean_delta_used: f64,
++    pub mean_entropy: f64,
++    pub mean_interval_d: f64,
++    pub mean_r: f64,
++    pub mean_input_change: f64,
++    pub mean_h_l2: f64,
++    pub mean_a_minus_a0: f64,
++    pub mean_u_effective: f64,
++    pub mean_w_effective: f64,
++    pub n_obs31_valid: u64,
++    pub mean_obs31: f64,
++}
++
++pub fn aggregate_decisions(diags: &[DecisionDiag]) -> DecisionAggregate {
++    let n = diags.len() as u64;
++    if n == 0 {
++        return DecisionAggregate::default();
++    }
++    let mut a = DecisionAggregate { n, ..DecisionAggregate::default() };
++    for d in diags {
++        a.n_updates += u64::from(d.applied_update);
++        a.n_clipped += u64::from(d.clipped);
++        a.mean_delta += d.delta;
++        a.mean_delta_used += d.delta_used;
++        a.mean_entropy += d.entropy;
++        a.mean_interval_d += d.interval_d as f64;
++        a.mean_r += d.r;
++        a.mean_input_change += d.input_change;
++        a.mean_h_l2 += d.h_l2_delta;
++        a.mean_a_minus_a0 += d.a_minus_a0_frob;
++        a.mean_u_effective += d.u_effective;
++        a.mean_w_effective += d.w_effective;
++        if d.obs[32 + 31] > 0.5 {
++            a.n_obs31_valid += 1;
++        }
++        a.mean_obs31 += d.obs[31];
++    }
++    let inv = n as f64;
++    a.mean_delta /= inv;
++    a.mean_delta_used /= inv;
++    a.mean_entropy /= inv;
++    a.mean_interval_d /= inv;
++    a.mean_r /= inv;
++    a.mean_input_change /= inv;
++    a.mean_h_l2 /= inv;
++    a.mean_a_minus_a0 /= inv;
++    a.mean_u_effective /= inv;
++    a.mean_w_effective /= inv;
++    a.mean_obs31 /= inv;
++    a
+ }
+ 
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+@@ -138,6 +316,28 @@ pub enum ControlMode {
+     ReflexQ,
+ }
+ 
++impl ControlMode {
++    pub fn code(self) -> u8 {
++        match self {
++            Self::Neural => 0,
++            Self::Stationary => 1,
++            Self::Forced { .. } => 2,
++            Self::OracleGotoLight => 3,
++            Self::ReflexQ => 4,
++        }
++    }
++
++    pub fn label(self) -> String {
++        match self {
++            Self::Neural => "Neural".into(),
++            Self::Stationary => "Stationary".into(),
++            Self::Forced { thrust, turn } => format!("Forced({thrust},{turn})"),
++            Self::OracleGotoLight => "OracleGotoLight".into(),
++            Self::ReflexQ => "ReflexQ".into(),
++        }
++    }
++}
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum FaultPoint {
+     AfterP1,
+diff --git a/crates/universe_core/src/sense.rs b/crates/universe_core/src/sense.rs
+index dc42277..067aa8a 100644
+--- a/crates/universe_core/src/sense.rs
++++ b/crates/universe_core/src/sense.rs
+@@ -1,7 +1,7 @@
+ //! Sense 64-vector: 32 values + 32 validity flags (ch. 36.1).
+ 
+-use crate::physics::cell_xy;
+-use universe_types::{Organism, RuleSpec, WorldState, INPUTS};
++use crate::physics::{cell_xy, tick_dt};
++use universe_types::{Accounts, IntervalFeedback, Organism, RuleSpec, WorldState, INPUTS};
+ 
+ const DIRS: [f64; 4] = [0.0, std::f64::consts::FRAC_PI_2, std::f64::consts::PI, -std::f64::consts::FRAC_PI_2];
+ const RANGES: [f64; 3] = [1.0, 2.0, 4.0];
+@@ -170,9 +170,19 @@ pub fn sense(state: &WorldState, spec: &RuleSpec, org: &Organism) -> [f64; INPUT
+     } else {
+         o[26] = sat01(fb.struct_loss as f64 / org.b_target as f64);
+         o[27] = sat11(fb.e_net_i128 as f64 / org.e_max as f64);
+-        let inv = fb.ticks as f64;
+-        o[28] = sat11((fb.thrust_sum / inv) / spec.physics.max_linear_speed);
+-        o[29] = sat11((fb.turn_sum / inv) / spec.physics.max_angular_speed);
++        let duration = tick_dt(spec) * fb.ticks as f64;
++        let vmax = spec.physics.max_linear_speed;
++        let wmax = spec.physics.max_angular_speed;
++        if duration > 0.0 && vmax > 0.0 {
++            o[28] = sat11((fb.thrust_sum / duration) / vmax);
++        } else {
++            o[28] = 0.0;
++        }
++        if duration > 0.0 && wmax > 0.0 {
++            o[29] = sat11((fb.turn_sum / duration) / wmax);
++        } else {
++            o[29] = 0.0;
++        }
+         let max_up = spec.rates.n_uptake_base.saturating_add(spec.rates.n_uptake_boost)
+             + spec.rates.o_uptake_when_on;
+         let max_up = max_up.saturating_mul(fb.ticks);
+@@ -185,3 +195,17 @@ pub fn sense(state: &WorldState, spec: &RuleSpec, org: &Organism) -> [f64; INPUT
+     }
+     o
+ }
++
++/// P0 body accounts + already-sealed interval feedback. Does not read post-P1 energy.
++pub fn sense_observation(
++    state: &WorldState,
++    spec: &RuleSpec,
++    org: &Organism,
++    p0_accounts: Accounts,
++    sealed_feedback: IntervalFeedback,
++) -> [f64; INPUTS] {
++    let mut view = org.clone();
++    view.accounts = p0_accounts;
++    view.last_feedback = sealed_feedback;
++    sense(state, spec, &view)
++}
+diff --git a/crates/universe_core/src/world.rs b/crates/universe_core/src/world.rs
+index 3c71182..7601242 100644
+--- a/crates/universe_core/src/world.rs
++++ b/crates/universe_core/src/world.rs
+@@ -10,13 +10,15 @@ use crate::physiology::{
+     deposit_death, is_irrecoverable, maintenance_cost, pay_maintenance_parts, scale_control_parts,
+ };
+ use crate::probe::{
+-    budget_p, ControlMode, DecisionDiag, FaultPoint, RunLedger, TickProbe,
++    budget_p, ControlMode, DecisionDiag, DecisionSkip, FaultPoint, ObservationFrame, RunLedger,
++    TickProbe,
+ };
+ use crate::react::{phase_p5b_uptake, phase_p5c_photo, phase_p5d_metab};
+ use crate::repro::{phase_births, phase_build_embryos, phase_start_embryos};
+-use crate::sense::sense;
++use crate::sense::sense_observation;
+ use universe_types::{
+-    LifeEvent, LifeEventKind, NumericFault, Organism, SimError, WorldState, RuleSpec, INPUTS,
++    rules_hash, Accounts, LifeEvent, LifeEventKind, LightingRules, NumericFault, Organism, SimError,
++    WorldState, RuleSpec, INPUTS,
+ };
+ 
+ #[derive(Clone, Debug)]
+@@ -37,6 +39,8 @@ pub struct World {
+     pub last_probe: TickProbe,
+     pub run_ledger: RunLedger,
+     pub last_decisions: Vec<DecisionDiag>,
++    pub last_skips: Vec<DecisionSkip>,
++    pub last_observation: std::collections::HashMap<u64, ObservationFrame>,
+     last_obs: std::collections::HashMap<u64, [f64; INPUTS]>,
+ }
+ 
+@@ -57,10 +61,32 @@ impl World {
+             last_probe: TickProbe::default(),
+             run_ledger: RunLedger::default(),
+             last_decisions: Vec::new(),
++            last_skips: Vec::new(),
++            last_observation: std::collections::HashMap::new(),
+             last_obs: std::collections::HashMap::new(),
+         }
+     }
+ 
++    pub fn apply_runtime(
++        &mut self,
++        freeze_learning: bool,
++        disable_active_motion: bool,
++        disable_reproduction: bool,
++        control_mode: ControlMode,
++    ) {
++        self.freeze_learning = freeze_learning;
++        self.disable_active_motion = disable_active_motion;
++        self.disable_reproduction = disable_reproduction;
++        self.control_mode = control_mode;
++    }
++
++    /// Versioned lighting change: executing RuleSpec and state's rules_hash stay aligned.
++    pub fn apply_lighting(&mut self, lighting: LightingRules) -> Result<(), SimError> {
++        self.spec.lighting = lighting;
++        self.state.rules_hash = rules_hash(&self.spec)?;
++        Ok(())
++    }
++
+     pub fn step(&mut self) -> Result<(), SimError> {
+         let living = self
+             .state
+@@ -78,6 +104,8 @@ impl World {
+         let ledger = self.run_ledger.clone();
+         let probe = self.last_probe.clone();
+         let decisions = self.last_decisions.clone();
++        let skips = self.last_skips.clone();
++        let frames = self.last_observation.clone();
+         let obs = self.last_obs.clone();
+         let metab_diss = self.last_metab_diss;
+         let metab_e = self.last_metab_e_new;
+@@ -89,6 +117,8 @@ impl World {
+                 self.run_ledger = ledger;
+                 self.last_probe = probe;
+                 self.last_decisions = decisions;
++                self.last_skips = skips;
++                self.last_observation = frames;
+                 self.last_obs = obs;
+                 self.last_metab_diss = metab_diss;
+                 self.last_metab_e_new = metab_e;
+@@ -138,7 +168,20 @@ impl World {
+             }
+         }
+ 
+-        // P0: future inputs (none unless queued).
++        // P0: unsupported future_inputs are rejected; observation uses this boundary.
++        if !self.state.future_inputs.is_empty() {
++            return Err(SimError::ExperimentSetup(
++                "non-empty future_inputs are not executed and must not be silently ignored".into(),
++            ));
++        }
++        let p0_accounts: std::collections::HashMap<u64, Accounts> = self
++            .state
++            .organisms
++            .iter()
++            .filter(|o| !o.marked_dead)
++            .map(|o| (o.entity_id, o.accounts))
++            .collect();
++
+         // P1: maintenance.
+         let present: Vec<u64> = self
+             .state
+@@ -147,8 +190,71 @@ impl World {
+             .filter(|o| !o.marked_dead)
+             .map(|o| o.entity_id)
+             .collect();
++        let decision = self.state.tick % self.spec.time.decision_every_ticks == 0;
++        let cog = self.spec.cognition_cost_b();
++        let n_org = self.state.organisms.len();
++        let mut will_decide = vec![false; n_org];
++        if decision {
++            self.last_observation.clear();
++            self.last_skips.clear();
++            for i in 0..n_org {
++                if self.state.organisms[i].marked_dead {
++                    continue;
++                }
++                let id = self.state.organisms[i].entity_id;
++                let has_emb = self.state.embryos.iter().any(|e| e.parent_id == id);
++                if cognition_eligible(&self.state.organisms[i], &self.spec, has_emb) {
++                    will_decide[i] = true;
++                    {
++                        let org = &mut self.state.organisms[i];
++                        org.last_feedback = org.feedback;
++                        org.feedback = universe_types::IntervalFeedback::default();
++                    }
++                    let org = &self.state.organisms[i];
++                    let tick = self.state.tick;
++                    let fb_ticks = org.last_feedback.ticks;
++                    let start = tick.saturating_sub(fb_ticks);
++                    let obs = sense_observation(
++                        &self.state,
++                        &self.spec,
++                        org,
++                        p0_accounts[&id],
++                        org.last_feedback,
++                    );
++                    self.last_observation.insert(
++                        id,
++                        ObservationFrame {
++                            entity_id: id,
++                            observation_state_tick: tick,
++                            feedback_start_tick: start,
++                            feedback_end_tick: tick,
++                            feedback_ticks: fb_ticks,
++                            obs,
++                            p0_e_old: p0_accounts[&id].e_old,
++                            p0_c: p0_accounts[&id].c,
++                        },
++                    );
++                } else {
++                    let org = &self.state.organisms[i];
++                    let reason = if org.accounts.e_old < maintenance_cost(org, &self.spec, has_emb)
++                    {
++                        "maintenance_unpaid"
++                    } else {
++                        "no_cognition_energy"
++                    };
++                    self.last_skips.push(DecisionSkip {
++                        tick: self.state.tick,
++                        entity_id: id,
++                        reason: reason.into(),
++                        e_old: org.accounts.e_old,
++                        open_feedback_ticks: org.feedback.ticks,
++                    });
++                }
++            }
++        }
++
+         let mut maint_diss = 0u64;
+-        let mut maint_ok = vec![false; self.state.organisms.len()];
++        let mut maint_ok = vec![false; n_org];
+         for i in 0..self.state.organisms.len() {
+             if self.state.organisms[i].marked_dead {
+                 continue;
+@@ -179,15 +285,12 @@ impl World {
+         }
+         self.add_diss(maint_diss)?;
+ 
+-        // Cognition fee on decision ticks.
+-        let decision = self.state.tick % self.spec.time.decision_every_ticks == 0;
+-        let cog = self.spec.cognition_cost_b();
+         if decision {
+             for (i, org) in self.state.organisms.iter_mut().enumerate() {
+                 if org.marked_dead {
+                     continue;
+                 }
+-                if maint_ok[i] && org.accounts.e_old >= cog {
++                if will_decide[i] && org.accounts.e_old >= cog {
+                     org.accounts.e_old -= cog;
+                     self.state.audit.step_dissipation = self
+                         .state
+@@ -226,43 +329,59 @@ impl World {
+                         .find(|g| g.hash == gh)
+                         .cloned();
+                     if let Some(g) = g {
+-                        let obs = sense(&self.state, &self.spec, &self.state.organisms[i]);
+-                        let org = &self.state.organisms[i];
+-                        let allow_repro = org.age >= self.spec.evolution.min_age
+-                            && org.accounts.b * self.spec.evolution.min_b_over_target_denom
+-                                >= self.spec.evolution.min_b_over_target_numer * org.b_target
+-                            && org.maintenance_debt == 0
+-                            && !self
+-                                .state
+-                                .embryos
+-                                .iter()
+-                                .any(|e| e.parent_id == org.entity_id)
+-                            && !self.disable_reproduction;
++                        let id = self.state.organisms[i].entity_id;
++                        let frame = self
++                            .last_observation
++                            .get(&id)
++                            .cloned()
++                            .ok_or_else(|| {
++                                SimError::ExperimentSetup("missing ObservationFrame for paid cognition".into())
++                            })?;
+                         let seed = self.state.root_seed;
+                         let tick = self.state.tick;
+                         let freeze = self.freeze_learning;
++                        let allow_repro = {
++                            let org = &self.state.organisms[i];
++                            org.age >= self.spec.evolution.min_age
++                                && org.accounts.b * self.spec.evolution.min_b_over_target_denom
++                                    >= self.spec.evolution.min_b_over_target_numer * org.b_target
++                                && org.maintenance_debt == 0
++                                && !self
++                                    .state
++                                    .embryos
++                                    .iter()
++                                    .any(|e| e.parent_id == org.entity_id)
++                                && !self.disable_reproduction
++                        };
+                         let mut diag = decide(
+                             &self.spec,
+                             &mut self.state.organisms[i],
+                             &g,
+-                            &obs,
++                            &frame.obs,
+                             seed,
+                             tick,
+                             freeze,
+                             allow_repro,
+                         )?;
++                        diag.observation_state_tick = frame.observation_state_tick;
++                        diag.feedback_start_tick = frame.feedback_start_tick;
++                        diag.feedback_end_tick = frame.feedback_end_tick;
++                        diag.feedback_ticks = frame.feedback_ticks;
++                        diag.obs = frame.obs;
++                        diag.actual_forward_displacement =
++                            self.state.organisms[i].last_feedback.thrust_sum;
++                        diag.actual_unwrapped_turn = self.state.organisms[i].last_feedback.turn_sum;
+                         if diag.applied_update {
+                             self.run_ledger.learning_update_count =
+                                 self.run_ledger.learning_update_count.saturating_add(1);
+                         }
+                         if self.enable_probe {
+-                            let id = self.state.organisms[i].entity_id;
+                             diag.input_change = if let Some(prev) = self.last_obs.get(&id) {
+-                                l2_delta(prev, &obs)
++                                l2_delta(prev, &frame.obs)
+                             } else {
+                                 0.0
+                             };
+-                            self.last_obs.insert(id, obs);
++                            self.last_obs.insert(id, frame.obs);
+                             self.last_decisions.push(diag);
+                         }
+                     }
+@@ -295,6 +414,7 @@ impl World {
+ 
+         // P3: pay motion attempt.
+         let mut motion_diss = 0u64;
++        let mut paid_rows: Vec<(u64, i8, i8, f64, f64, u64)> = Vec::new();
+         for org in &mut self.state.organisms {
+             if org.marked_dead {
+                 continue;
+@@ -311,33 +431,39 @@ impl World {
+             motion_diss = motion_diss
+                 .checked_add(pay.total())
+                 .ok_or(NumericFault::Overflow("motion_sum"))?;
++            paid_rows.push((
++                org.entity_id,
++                org.control.thrust,
++                org.control.turn,
++                org.control.u_effective,
++                org.control.w_effective,
++                pay.total(),
++            ));
+         }
+         self.add_diss(motion_diss)?;
+-        if let Some(last) = self.last_decisions.last_mut() {
+-            if let Some(org) = self
+-                .state
+-                .organisms
+-                .iter()
+-                .find(|o| o.entity_id == last.entity_id)
++        let tick_now = self.state.tick;
++        for (eid, pu, pw, ue, we, energy) in paid_rows {
++            if let Some(last) = self
++                .last_decisions
++                .iter_mut()
++                .rev()
++                .find(|d| d.tick == tick_now && d.entity_id == eid)
+             {
+-                last.paid_thrust = org.control.thrust;
+-                last.paid_turn = org.control.turn;
++                last.paid_thrust = pu;
++                last.paid_turn = pw;
++                last.u_effective = ue;
++                last.w_effective = we;
++                last.paid_motion_energy = energy;
+             }
+         }
+ 
+         // P4
+         physics_substeps(&mut self.state, &self.spec)?;
+-        let dt = 0.025;
+-        let nsub = self.spec.physics.substeps as f64;
+         for org in &self.state.organisms {
+             if org.marked_dead {
+                 continue;
+             }
+-            let dth = nsub
+-                * org.control.w_effective.abs()
+-                * self.spec.physics.max_angular_speed
+-                * dt;
+-            let scaled = (dth * 1e9).round().max(0.0) as u64;
++            let scaled = (org.last_dtheta.abs() * 1e9).round().max(0.0) as u64;
+             probe.abs_dtheta = probe.abs_dtheta.saturating_add(scaled);
+         }
+         self.maybe_fault(FaultPoint::AfterP4)?;
+@@ -416,13 +542,9 @@ impl World {
+             // Reward dying bodies before wiping accounts (ch. 37.4).
+             let r = tick_reward(&self.state.organisms[i], &self.spec, 0, true);
+             accumulate_interval(&mut self.state.organisms[i].brain, r, &self.spec);
+-            let u_eff = self.state.organisms[i].control.u_effective;
+-            let w_eff = self.state.organisms[i].control.w_effective;
+             {
+                 let fb = &mut self.state.organisms[i].feedback;
+                 fb.ticks += 1;
+-                fb.thrust_sum += u_eff;
+-                fb.turn_sum += w_eff;
+                 fb.died = true;
+             }
+             let d = deposit_death(&mut self.state, &self.spec, i)?;
+@@ -457,12 +579,8 @@ impl World {
+             let births = births_this.get(&id).copied().unwrap_or(0);
+             let r = tick_reward(&self.state.organisms[i], &self.spec, births, false);
+             accumulate_interval(&mut self.state.organisms[i].brain, r, &self.spec);
+-            let u_eff = self.state.organisms[i].control.u_effective;
+-            let w_eff = self.state.organisms[i].control.w_effective;
+             let fb = &mut self.state.organisms[i].feedback;
+             fb.ticks += 1;
+-            fb.thrust_sum += u_eff;
+-            fb.turn_sum += w_eff;
+         }
+         self.state.organisms.retain(|o| !o.marked_dead);
+         gc_unreferenced_genomes(&mut self.state);
+@@ -580,10 +698,14 @@ impl World {
+                     {
+                         continue;
+                     }
+-                    let obs = sense(&self.state, &self.spec, &self.state.organisms[i]);
++                    let id = self.state.organisms[i].entity_id;
++                    let frame = match self.last_observation.get(&id) {
++                        Some(f) => f.clone(),
++                        None => continue,
++                    };
+                     let org = &mut self.state.organisms[i];
+                     zero_control(org);
+-                    reflex_q(org, &self.spec, &obs);
++                    reflex_q(org, &self.spec, &frame);
+                 }
+             }
+         }
+@@ -707,7 +829,8 @@ fn oracle_goto(org: &mut Organism, target: (f64, f64)) {
+     }
+ }
+ 
+-fn reflex_q(org: &mut Organism, spec: &RuleSpec, obs: &[f64; INPUTS]) {
++fn reflex_q(org: &mut Organism, spec: &RuleSpec, frame: &ObservationFrame) {
++    let obs = &frame.obs;
+     let ticks = org.last_feedback.ticks.max(1);
+     let photo_per = org.last_feedback.photo_extent as f64 / ticks as f64;
+     let p_in = photo_per * 8.0;
+@@ -748,6 +871,20 @@ fn reflex_q(org: &mut Organism, spec: &RuleSpec, obs: &[f64; INPUTS]) {
+     }
+ }
+ 
++fn cognition_eligible(org: &Organism, spec: &RuleSpec, has_emb: bool) -> bool {
++    let cost = maintenance_cost(org, spec, has_emb);
++    if org.accounts.e_old < cost {
++        return false;
++    }
++    let mut e = org.accounts.e_old - cost;
++    let debt = org.maintenance_debt;
++    if debt > 0 && e > 0 {
++        let repay = e.min(spec.physiology.debt_repay_per_tick).min(debt);
++        e -= repay;
++    }
++    e >= spec.cognition_cost_b()
++}
++
+ fn gc_unreferenced_genomes(state: &mut WorldState) {
+     let mut keep = std::collections::BTreeSet::new();
+     for o in &state.organisms {
+diff --git a/crates/universe_lab/src/bin/d2.rs b/crates/universe_lab/src/bin/d2.rs
+new file mode 100644
+index 0000000..cd4cd4d
+--- /dev/null
++++ b/crates/universe_lab/src/bin/d2.rs
+@@ -0,0 +1,14 @@
++//! Write D2 artefacts under docs/d2 (or a given directory).
++
++fn main() {
++    let out = std::env::args()
++        .nth(1)
++        .unwrap_or_else(|| "docs/d2".to_string());
++    match universe_lab::d2::run_d2_campaign(&out) {
++        Ok(()) => eprintln!("D2 wrote {out}"),
++        Err(e) => {
++            eprintln!("D2 failed: {e}");
++            std::process::exit(1);
++        }
++    }
++}
+diff --git a/crates/universe_lab/src/d2.rs b/crates/universe_lab/src/d2.rs
+new file mode 100644
+index 0000000..36c5466
+--- /dev/null
++++ b/crates/universe_lab/src/d2.rs
+@@ -0,0 +1,563 @@
++//! D2 diagnostic campaign: structured results, no hardcoded pass prose.
++
++use std::fs;
++use std::io::Write;
++use std::path::Path;
++
++use universe_core::init::{initialize_reversal_world, retarget_audit_baseline};
++use universe_core::probe::{aggregate_decisions, ControlMode, DecisionAggregate, DecisionDiag};
++use universe_core::world::World;
++use universe_core::{compute_mu, scale_control_parts};
++use universe_types::{hex_hash, rules_hash};
++
++use crate::experiment::{
++    close_light_keep_q, light_right_schedule, source_identity, ExperimentDef, RuntimePack,
++    SourceIdentity,
++};
++use crate::reversal_spec;
++
++#[derive(Clone, Debug)]
++pub struct CaseResult {
++    pub id: String,
++    pub ok: bool,
++    pub detail: String,
++    pub experiment_hash: String,
++    pub rules_hash: String,
++    pub error: Option<String>,
++}
++
++#[derive(Clone, Debug)]
++pub struct D2Report {
++    pub source: SourceIdentity,
++    pub cases: Vec<CaseResult>,
++    pub aggregates: Vec<(String, DecisionAggregate)>,
++    pub sample_frames: Vec<DecisionDiag>,
++    pub open_issues: Vec<String>,
++}
++
++impl D2Report {
++    pub fn has_experiment_error(&self) -> bool {
++        self.cases.iter().any(|c| c.error.is_some() || !c.ok)
++    }
++}
++
++fn def_base(id: &str, seed: u64, control: ControlMode, freeze: bool) -> ExperimentDef {
++    ExperimentDef {
++        name: id.into(),
++        version: 2,
++        spec: reversal_spec(),
++        controller: control,
++        freeze_learning: freeze,
++        disable_reproduction: true,
++        disable_active_motion: false,
++        start_x: None,
++        start_y: None,
++        heading: None,
++        dark_quench_q: false,
++        dark_close_input: false,
++        switch_tick: None,
++        max_ticks: 12,
++        seed,
++        metric_name: "d2_short".into(),
++        stat_seed: 20260910,
++    }
++}
++
++fn world_from_def(def: &ExperimentDef) -> Result<World, String> {
++    let mut st = initialize_reversal_world(&def.spec, def.seed).map_err(|e| e.to_string())?;
++    if let Some(x) = def.start_x {
++        st.organisms[0].geom.x = x;
++    }
++    if let Some(y) = def.start_y {
++        st.organisms[0].geom.y = y;
++    }
++    if let Some(h) = def.heading {
++        st.organisms[0].geom.theta = h;
++    }
++    if def.dark_quench_q {
++        for q in &mut st.fields.q {
++            *q = 0;
++        }
++        for r in &mut st.fields.q_remainder {
++            *r = 0;
++        }
++        retarget_audit_baseline(&mut st, &def.spec).map_err(|e| e.to_string())?;
++    }
++    let mut w = World::from_state(def.spec.clone(), st);
++    w.apply_runtime(
++        def.freeze_learning,
++        def.disable_active_motion,
++        def.disable_reproduction,
++        def.controller,
++    );
++    w.enable_probe = true;
++    if def.dark_close_input {
++        w.apply_lighting(close_light_keep_q(&w.spec))
++            .map_err(|e| e.to_string())?;
++    }
++    Ok(w)
++}
++
++fn run_steps(w: &mut World, n: u64) -> Result<(), String> {
++    for _ in 0..n {
++        w.step().map_err(|e| e.to_string())?;
++    }
++    Ok(())
++}
++
++pub fn run_d2_cases() -> D2Report {
++    let source = source_identity();
++    let mut cases = Vec::new();
++    let mut aggregates = Vec::new();
++    let mut sample_frames = Vec::new();
++
++    // FB01 short
++    {
++        let mut def = def_base("FB01", 11, ControlMode::Stationary, true);
++        def.start_x = Some(4.5);
++        def.start_y = Some(8.5);
++        def.heading = Some(0.0);
++        let eh = hex_hash(&def.experiment_hash());
++        let rh = hex_hash(&def.rules_hash());
++        let mut w = match world_from_def(&def) {
++            Ok(w) => w,
++            Err(e) => {
++                cases.push(CaseResult {
++                    id: "FB01".into(),
++                    ok: false,
++                    detail: String::new(),
++                    experiment_hash: eh,
++                    rules_hash: rh,
++                    error: Some(e),
++                });
++                return finish(source, cases, aggregates, sample_frames);
++            }
++        };
++        match run_steps(&mut w, 6) {
++            Ok(()) => {
++                let d5 = w.last_decisions.iter().find(|d| d.tick == 5);
++                let ok = d5
++                    .map(|d| d.feedback_ticks == 5 && d.obs[32 + 31] > 0.5 && d.obs[31] > 0.0)
++                    .unwrap_or(false);
++                cases.push(CaseResult {
++                    id: "FB01".into(),
++                    ok,
++                    detail: format!("decisions={} ", w.last_decisions.len()),
++                    experiment_hash: eh,
++                    rules_hash: rh,
++                    error: None,
++                });
++                aggregates.push(("FB01".into(), aggregate_decisions(&w.last_decisions)));
++                sample_frames = w.last_decisions.clone();
++            }
++            Err(e) => cases.push(CaseResult {
++                id: "FB01".into(),
++                ok: false,
++                detail: String::new(),
++                experiment_hash: eh,
++                rules_hash: rh,
++                error: Some(e),
++            }),
++        }
++    }
++
++    // EX02: hash sensitivity
++    {
++        let a = def_base("EX02a", 11, ControlMode::Neural, false);
++        let mut b = a.clone();
++        b.seed = 12;
++        let mut c = a.clone();
++        c.controller = ControlMode::Stationary;
++        let ha = hex_hash(&a.experiment_hash());
++        let hb = hex_hash(&b.experiment_hash());
++        let hc = hex_hash(&c.experiment_hash());
++        let ok = ha != hb && ha != hc && hb != hc;
++        cases.push(CaseResult {
++            id: "EX02".into(),
++            ok,
++            detail: format!("a={ha} b={hb} c={hc}"),
++            experiment_hash: ha,
++            rules_hash: hex_hash(&a.rules_hash()),
++            error: None,
++        });
++    }
++
++    // runtime pack restores flags
++    {
++        let def = def_base("AR02pack", 7, ControlMode::OracleGotoLight, true);
++        let mut w = world_from_def(&def).expect("world");
++        let _ = run_steps(&mut w, 4);
++        w.apply_lighting(light_right_schedule(&w.spec)).ok();
++        let pack = RuntimePack::from_world(&w);
++        let h0 = pack.content_hash();
++        let mut w2 = pack.into_world();
++        w2.enable_probe = true;
++        let ok = w2.freeze_learning
++            && w2.control_mode == ControlMode::OracleGotoLight
++            && w2.disable_reproduction
++            && w2.state.rules_hash == rules_hash(&w2.spec).unwrap();
++        cases.push(CaseResult {
++            id: "AR02".into(),
++            ok,
++            detail: format!("pack={}", hex_hash(&h0)),
++            experiment_hash: hex_hash(&def.experiment_hash()),
++            rules_hash: hex_hash(&def.rules_hash()),
++            error: None,
++        });
++    }
++
++    // dark keep-Q vs quench: public new initial U0
++    {
++        let spec = reversal_spec();
++        let keep = initialize_reversal_world(&spec, 7).unwrap();
++        let u_keep0 = keep.audit.initial_u;
++        let q_keep = keep.fields.q.iter().copied().sum::<u64>();
++        let mut wkeep = World::from_state(spec.clone(), keep);
++        wkeep.apply_runtime(true, false, true, ControlMode::Stationary);
++        wkeep.apply_lighting(close_light_keep_q(&wkeep.spec)).unwrap();
++        let mut quench = initialize_reversal_world(&spec, 7).unwrap();
++        for q in &mut quench.fields.q {
++            *q = 0;
++        }
++        for r in &mut quench.fields.q_remainder {
++            *r = 0;
++        }
++        retarget_audit_baseline(&mut quench, &spec).unwrap();
++        let mu = compute_mu(&quench, spec.reactions.chem_e_per_organic).unwrap();
++        let ok = q_keep > 0 && quench.audit.initial_u == mu.u && quench.audit.initial_u != u_keep0;
++        cases.push(CaseResult {
++            id: "R04-dark".into(),
++            ok,
++            detail: format!("keep_q={q_keep} quench_u0={} keep_u0={u_keep0}", quench.audit.initial_u),
++            experiment_hash: hex_hash(&def_base("R04-dark", 7, ControlMode::Stationary, true).experiment_hash()),
++            rules_hash: hex_hash(&rules_hash(&spec).unwrap()),
++            error: None,
++        });
++    }
++
++    // P3 still scales
++    {
++        let spec = reversal_spec();
++        let mut org = initialize_reversal_world(&spec, 1).unwrap().organisms.remove(0);
++        org.accounts.e_old = 600;
++        org.accounts.e_new = 40_000;
++        org.control.thrust = 1;
++        org.control.turn = 1;
++        let pay = scale_control_parts(&mut org, &spec).unwrap();
++        let ok = pay.total() == 600 && (org.control.u_effective - 0.5).abs() < 1e-12;
++        cases.push(CaseResult {
++            id: "MV04-unit".into(),
++            ok,
++            detail: format!("paid={}", pay.total()),
++            experiment_hash: String::new(),
++            rules_hash: hex_hash(&rules_hash(&spec).unwrap()),
++            error: None,
++        });
++    }
++
++    finish(source, cases, aggregates, sample_frames)
++}
++
++fn finish(
++    source: SourceIdentity,
++    cases: Vec<CaseResult>,
++    aggregates: Vec<(String, DecisionAggregate)>,
++    sample_frames: Vec<DecisionDiag>,
++) -> D2Report {
++    D2Report {
++        source,
++        cases,
++        aggregates,
++        sample_frames,
++        open_issues: open_issue_lines(),
++    }
++}
++
++pub fn open_issue_lines() -> Vec<String> {
++    vec![
++        "R08 P2: 鍏变韩閰嶉骞冲眬浠嶅浐瀹?priority=0锛屾湭鎺ュ叆 QuotaTie锛涘崟浣?F2 鏃犵珵浜夛紝鍙殧绂汇€?.into(),
++        "R09 P2: repair 鍙嶅簲鏈帴鍏ヤ笘鐣屾杩涳紝灞?B 鐗堢己澶辫€岄潪 E/S銆侳2 榛樿婊＄粨鏋勩€佹棤鎹熶激銆佹棤鍑虹敓锛屽彲闅旂锛涘畬鏁?B 鐗堥』琛ヤ笘鐣岀骇 repair銆傚嚭鐢熷綋姝ヤ粛绱鏂扮敓浣撳弽棣堬紝绻佹畺楠屾敹鍓嶅鐞嗐€?.into(),
++        "R10 P2: validate 鏈嫆缁?q_loss_divisor=0 / substeps=0 绛夛紱閮ㄥ垎鍏ュ搱甯屽弬鏁颁粛鏈夌‖缂栫爜璺緞銆傚弬鏁版壂鎻忓墠淇銆?.into(),
++        "R11 P2: enable_probe 鏃?last_decisions 鏃犵晫涓旀瘡姝ユ繁鎷疯礉銆傞暱鏃堕棿鎺㈤拡杩愯鍓嶉』鍔犻噰鏍烽绠椼€?.into(),
++        "AT02/AT03: 鑳氫綋鏋勯€犱笌鍑虹敓 ID 鍒嗛厤鏁呴殰娉ㄥ叆鍒楀叆绻佹畺楠屾敹鎵规锛涙湰杞崟浣撳叧绻佹畺 F2 寤舵湡銆?.into(),
++        "AR03 妗ｆ浜嬩欢浜嬪姟宸茶ˉ骞傜瓑涓婚敭锛涢暱鏈熸。妗堜骇鍝佸叾浣欒兘鍔涗笉浠ラ€氳繃璁恒€?.into(),
++    ]
++}
++
++pub fn write_d2_artefacts(out_dir: impl AsRef<Path>, report: &D2Report) -> Result<(), String> {
++    let out = out_dir.as_ref();
++    fs::create_dir_all(out).map_err(|e| e.to_string())?;
++    write_manifest(out, report)?;
++    write_cases_csv(out, report)?;
++    write_aggregates_csv(out, report)?;
++    write_frames_csv(out, report)?;
++    write_open_issues(out, report)?;
++    write_report_md(out, report)?;
++    Ok(())
++}
++
++fn write_manifest(out: &Path, report: &D2Report) -> Result<(), String> {
++    let failed = report.has_experiment_error();
++    let body = format!(
++        "{{\n  \"campaign\": \"D2\",\n  \"commit\": \"{}\",\n  \"dirty\": {},\n  \"source_digest\": \"{}\",\n  \"rustc\": \"{}\",\n  \"base_rules_hash\": \"{}\",\n  \"status\": \"{}\",\n  \"note\": \"docs/d1 and docs/batches/G5.md are historical; this directory is D2 only.\"\n}}\n",
++        report.source.commit,
++        report.source.dirty,
++        report.source.source_digest,
++        report.source.rustc.replace('"', "'"),
++        hex_hash(&ExperimentDef::base_rules_hash()),
++        if failed { "experiment_or_case_failed" } else { "cases_recorded" }
++    );
++    fs::write(out.join("manifest.json"), body).map_err(|e| e.to_string())
++}
++
++fn write_cases_csv(out: &Path, report: &D2Report) -> Result<(), String> {
++    let mut f = fs::File::create(out.join("cases.csv")).map_err(|e| e.to_string())?;
++    writeln!(f, "id,ok,error,rules_hash,experiment_hash,detail").map_err(|e| e.to_string())?;
++    for c in &report.cases {
++        writeln!(
++            f,
++            "{},{},{},{},{},{}",
++            c.id,
++            u8::from(c.ok),
++            csv_escape(c.error.as_deref().unwrap_or("")),
++            c.rules_hash,
++            c.experiment_hash,
++            csv_escape(&c.detail)
++        )
++        .map_err(|e| e.to_string())?;
++    }
++    Ok(())
++}
++
++fn write_aggregates_csv(out: &Path, report: &D2Report) -> Result<(), String> {
++    let mut f = fs::File::create(out.join("decision_aggregates.csv")).map_err(|e| e.to_string())?;
++    writeln!(
++        f,
++        "case,n,n_updates,n_clipped,mean_delta,mean_entropy,mean_interval_d,mean_u_effective,n_obs31_valid,mean_obs31"
++    )
++    .map_err(|e| e.to_string())?;
++    for (name, a) in &report.aggregates {
++        writeln!(
++            f,
++            "{},{},{},{},{:.8},{:.8},{:.8},{:.8},{},{:.8}",
++            name,
++            a.n,
++            a.n_updates,
++            a.n_clipped,
++            a.mean_delta,
++            a.mean_entropy,
++            a.mean_interval_d,
++            a.mean_u_effective,
++            a.n_obs31_valid,
++            a.mean_obs31
++        )
++        .map_err(|e| e.to_string())?;
++    }
++    Ok(())
++}
++
++fn write_frames_csv(out: &Path, report: &D2Report) -> Result<(), String> {
++    let mut f = fs::File::create(out.join("frames.csv")).map_err(|e| e.to_string())?;
++    writeln!(
++        f,
++        "entity_id,decision_tick,observation_state_tick,feedback_start_tick,feedback_end_tick,feedback_ticks,interval_d,R,u_effective,w_effective,paid_motion_energy,actual_forward_displacement,actual_unwrapped_turn,intent_u,intent_w,p_thr0,p_thr1,p_thr2,p_turn0,p_turn1,p_turn2,obs31,obs31_valid,phi0,phi1"
++    )
++    .map_err(|e| e.to_string())?;
++    for d in &report.sample_frames {
++        writeln!(
++            f,
++            "{},{},{},{},{},{},{},{:.8},{:.8},{:.8},{},{:.8},{:.8},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6}",
++            d.entity_id,
++            d.tick,
++            d.observation_state_tick,
++            d.feedback_start_tick,
++            d.feedback_end_tick,
++            d.feedback_ticks,
++            d.interval_d,
++            d.r,
++            d.u_effective,
++            d.w_effective,
++            d.paid_motion_energy,
++            d.actual_forward_displacement,
++            d.actual_unwrapped_turn,
++            d.intent_thrust,
++            d.intent_turn,
++            d.p_thr[0],
++            d.p_thr[1],
++            d.p_thr[2],
++            d.p_turn[0],
++            d.p_turn[1],
++            d.p_turn[2],
++            d.obs[31],
++            u8::from(d.obs[32 + 31] > 0.5),
++            d.phi[0],
++            d.phi[1]
++        )
++        .map_err(|e| e.to_string())?;
++    }
++    let mut full = fs::File::create(out.join("frames_obs64.csv")).map_err(|e| e.to_string())?;
++    write!(full, "decision_tick").map_err(|e| e.to_string())?;
++    for i in 0..64 {
++        write!(full, ",obs{i}").map_err(|e| e.to_string())?;
++    }
++    writeln!(full).map_err(|e| e.to_string())?;
++    for d in &report.sample_frames {
++        write!(full, "{}", d.tick).map_err(|e| e.to_string())?;
++        for v in d.obs {
++            write!(full, ",{v:.8}").map_err(|e| e.to_string())?;
++        }
++        writeln!(full).map_err(|e| e.to_string())?;
++    }
++    Ok(())
++}
++
++fn write_open_issues(out: &Path, report: &D2Report) -> Result<(), String> {
++    let mut s = String::from("# D2 鏈В鍐抽棶棰榎n\n");
++    for line in &report.open_issues {
++        s.push_str("- ");
++        s.push_str(line);
++        s.push('\n');
++    }
++    fs::write(out.join("open_issues.md"), s).map_err(|e| e.to_string())
++}
++
++fn write_report_md(out: &Path, report: &D2Report) -> Result<(), String> {
++    let failed = report.has_experiment_error();
++    let mut md = String::new();
++    md.push_str("# D2 淇鎶ュ憡\n\n");
++    md.push_str(&format!(
++        "婧愮爜鎻愪氦 `{}` dirty={} source_digest=`{}`\n\n",
++        report.source.commit, report.source.dirty, report.source.source_digest
++    ));
++    md.push_str("鏈姤鍛婄敱 `docs/d2/` 缁撴瀯鍖栫粨鏋滅敓鎴愩€俙docs/d1/` 涓?`docs/batches/G5.md` 淇濇寔鍘熶欢銆俓n\n");
++    if failed {
++        md.push_str("**鐘舵€侊細瀛樺湪澶辫触鎴栧疄楠岄敊璇紝涓嶅緱瑙ｈ涓烘櫘閫氶€氳繃銆?*\n\n");
++    } else {
++        md.push_str("**鐘舵€侊細鎵€鍒楃煭瀵圭収鍧囪褰曚负 ok锛涜繖涓嶆槸瀛︿範闂ㄧ閫氳繃锛屼篃涓嶆槸 F2 姝ｅ紡璺戞暟銆?*\n\n");
++    }
++    md.push_str("## 瀵圭収\n\n");
++    for c in &report.cases {
++        md.push_str(&format!(
++            "- {}锛歰k={} error={} {}\n",
++            c.id,
++            c.ok,
++            c.error.as_deref().unwrap_or("鈥?),
++            c.detail
++        ));
++    }
++    md.push_str("\n## 瀹為檯瑙勫垯鍝堝笇\n\n");
++    md.push_str(&format!(
++        "- 128脳128 鍩虹 RuleSpec锛歚{}`\n",
++        hex_hash(&ExperimentDef::base_rules_hash())
++    ));
++    if let Some(c) = report.cases.iter().find(|c| c.id == "FB01") {
++        md.push_str(&format!("- 鏈疆 16脳16 瀹為獙 RuleSpec锛團B01锛夛細`{}`\n", c.rules_hash));
++    }
++    md.push_str("\n瀛︿範鐜囥€佸鍔辩郴鏁颁笌缃戠粶瑙勬ā鏈敼銆傛湭鎺ㄨ繘 E/S/閰嶅銆俓n\n");
++    md.push_str("F2 鐨?200-tick 绛夊緟鍙檺鍒舵寚鏍囩獥鍙ｏ紝涓嶆帹杩熷涔?鍐荤粨鍒嗘敮鏃跺埢銆傛寮忕瀛愬喕缁撳墠涓嶈窇姝ｅ紡 F2銆俓n\n");
++    md.push_str("## 鏈В鍐抽棶棰榎n\n");
++    for line in &report.open_issues {
++        md.push_str("- ");
++        md.push_str(line);
++        md.push('\n');
++    }
++    fs::write(out.join("report.md"), md).map_err(|e| e.to_string())
++}
++
++fn csv_escape(s: &str) -> String {
++    if s.contains(',') || s.contains('"') {
++        format!("\"{}\"", s.replace('"', "\"\""))
++    } else {
++        s.to_string()
++    }
++}
++
++pub fn run_d2_campaign(out_dir: impl AsRef<Path>) -> Result<(), String> {
++    let report = run_d2_cases();
++    write_d2_artefacts(out_dir, &report)?;
++    if report.has_experiment_error() {
++        return Err("D2 cases recorded failures or experiment errors".into());
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn experiment_hash_changes_with_seed_and_controller() {
++        let a = def_base("t", 1, ControlMode::Neural, false);
++        let mut b = a.clone();
++        b.seed = 2;
++        let mut c = a.clone();
++        c.controller = ControlMode::ReflexQ;
++        assert_ne!(a.experiment_hash(), b.experiment_hash());
++        assert_ne!(a.experiment_hash(), c.experiment_hash());
++    }
++
++    #[test]
++    fn report_refuses_pass_on_error() {
++        let mut r = run_d2_cases();
++        r.cases.push(CaseResult {
++            id: "EX01".into(),
++            ok: false,
++            detail: String::new(),
++            experiment_hash: String::new(),
++            rules_hash: String::new(),
++            error: Some("injected".into()),
++        });
++        assert!(r.has_experiment_error());
++    }
++
++    #[test]
++    fn d2_short_cases_ok() {
++        let r = run_d2_cases();
++        for c in &r.cases {
++            assert!(c.error.is_none(), "{} {:?}", c.id, c.error);
++            assert!(c.ok, "{} {}", c.id, c.detail);
++        }
++        assert!(r.sample_frames.iter().any(|d| d.tick == 5 && d.obs[31] > 0.0));
++    }
++
++    #[test]
++    fn s0_restore_replays_without_periodic_snapshot() {
++        use universe_archive::Archive;
++        use universe_core::init::initialize_reversal_world;
++        use universe_types::state_hash;
++        let spec = reversal_spec();
++        let dir = std::env::temp_dir().join(format!(
++            "eu-d2-s0-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        let mut arch = Archive::open(&dir, &spec).unwrap();
++        let st = initialize_reversal_world(&spec, 3).unwrap();
++        arch.record_initial(&st).unwrap();
++        let mut w = World::from_state(spec.clone(), st);
++        w.disable_reproduction = true;
++        w.freeze_learning = true;
++        w.control_mode = ControlMode::Stationary;
++        for _ in 0..7 {
++            w.step().unwrap();
++            arch.record_committed(&w.state, &w.last_events).unwrap();
++        }
++        let target = w.state.tick;
++        let expect = state_hash(&w.state).unwrap();
++        let (snap_tick, path, h) = arch.latest_snapshot_tick(target).unwrap().unwrap();
++        assert_eq!(snap_tick, 0);
++        let loaded = Archive::load_snapshot_file(&path, Some(h)).unwrap();
++        let mut w2 = World::from_state(spec, loaded);
++        w2.disable_reproduction = true;
++        w2.freeze_learning = true;
++        w2.control_mode = ControlMode::Stationary;
++        while w2.state.tick < target {
++            w2.step().unwrap();
++        }
++        assert_eq!(state_hash(&w2.state).unwrap(), expect);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}
+diff --git a/crates/universe_lab/src/experiment.rs b/crates/universe_lab/src/experiment.rs
+new file mode 100644
+index 0000000..28b7562
+--- /dev/null
++++ b/crates/universe_lab/src/experiment.rs
+@@ -0,0 +1,194 @@
++//! Canonical experiment definition, source identity, and restorable runtime packs.
++
++use universe_core::probe::ControlMode;
++use universe_core::world::World;
++use universe_types::{
++    hex_hash, rules_hash, sha256, state_hash, CanonWriter, Hash32, LightingRules, RuleSpec,
++    WorldState,
++};
++
++#[derive(Clone, Debug)]
++pub struct SourceIdentity {
++    pub commit: String,
++    pub dirty: bool,
++    pub source_digest: String,
++    pub rustc: String,
++}
++
++pub fn source_identity() -> SourceIdentity {
++    let commit = crate::d1::git_commit();
++    let dirty = std::process::Command::new("git")
++        .args(["status", "--porcelain"])
++        .output()
++        .ok()
++        .map(|o| o.status.success() && !o.stdout.is_empty())
++        .unwrap_or(true);
++    let diff = std::process::Command::new("git")
++        .args(["diff", "HEAD"])
++        .output()
++        .ok()
++        .map(|o| o.stdout)
++        .unwrap_or_default();
++    let source_digest = hex_hash(&sha256(&diff));
++    let rustc = std::process::Command::new("rustc")
++        .arg("--version")
++        .output()
++        .ok()
++        .and_then(|o| String::from_utf8(o.stdout).ok())
++        .map(|s| s.trim().to_string())
++        .unwrap_or_else(|| "unknown".into());
++    SourceIdentity {
++        commit,
++        dirty,
++        source_digest,
++        rustc,
++    }
++}
++
++#[derive(Clone, Debug)]
++pub struct ExperimentDef {
++    pub name: String,
++    pub version: u32,
++    pub spec: RuleSpec,
++    pub controller: ControlMode,
++    pub freeze_learning: bool,
++    pub disable_reproduction: bool,
++    pub disable_active_motion: bool,
++    pub start_x: Option<f64>,
++    pub start_y: Option<f64>,
++    pub heading: Option<f64>,
++    pub dark_quench_q: bool,
++    pub dark_close_input: bool,
++    pub switch_tick: Option<u64>,
++    pub max_ticks: u64,
++    pub seed: u64,
++    pub metric_name: String,
++    pub stat_seed: u64,
++}
++
++impl ExperimentDef {
++    pub fn rules_hash(&self) -> Hash32 {
++        rules_hash(&self.spec).expect("rules")
++    }
++
++    pub fn base_rules_hash() -> Hash32 {
++        rules_hash(&RuleSpec::eu_core_1()).expect("base")
++    }
++
++    pub fn encode_canonical(&self) -> Vec<u8> {
++        let mut w = CanonWriter::new();
++        w.raw(b"EUD2");
++        w.u32(self.version);
++        w.raw(self.name.as_bytes());
++        w.u8(0);
++        w.raw(&self.spec.encode_canonical().expect("spec"));
++        w.u8(self.controller.code());
++        match self.controller {
++            ControlMode::Forced { thrust, turn } => {
++                w.i8(thrust);
++                w.i8(turn);
++            }
++            _ => {
++                w.i8(0);
++                w.i8(0);
++            }
++        }
++        w.bool(self.freeze_learning);
++        w.bool(self.disable_reproduction);
++        w.bool(self.disable_active_motion);
++        w.bool(self.start_x.is_some());
++        if let Some(x) = self.start_x {
++            w.f64_canonical(x).expect("x");
++        }
++        w.bool(self.start_y.is_some());
++        if let Some(y) = self.start_y {
++            w.f64_canonical(y).expect("y");
++        }
++        w.bool(self.heading.is_some());
++        if let Some(h) = self.heading {
++            w.f64_canonical(h).expect("h");
++        }
++        w.bool(self.dark_quench_q);
++        w.bool(self.dark_close_input);
++        w.bool(self.switch_tick.is_some());
++        if let Some(t) = self.switch_tick {
++            w.u64(t);
++        }
++        w.u64(self.max_ticks);
++        w.u64(self.seed);
++        w.raw(self.metric_name.as_bytes());
++        w.u8(0);
++        w.u64(self.stat_seed);
++        w.into_inner()
++    }
++
++    pub fn experiment_hash(&self) -> Hash32 {
++        sha256(&self.encode_canonical())
++    }
++}
++
++#[derive(Clone, Debug)]
++pub struct RuntimePack {
++    pub spec: RuleSpec,
++    pub state: WorldState,
++    pub freeze_learning: bool,
++    pub disable_reproduction: bool,
++    pub disable_active_motion: bool,
++    pub control_mode: ControlMode,
++}
++
++impl RuntimePack {
++    pub fn from_world(w: &World) -> Self {
++        Self {
++            spec: w.spec.clone(),
++            state: w.state.clone(),
++            freeze_learning: w.freeze_learning,
++            disable_reproduction: w.disable_reproduction,
++            disable_active_motion: w.disable_active_motion,
++            control_mode: w.control_mode,
++        }
++    }
++
++    pub fn into_world(self) -> World {
++        let mut w = World::from_state(self.spec, self.state);
++        w.apply_runtime(
++            self.freeze_learning,
++            self.disable_active_motion,
++            self.disable_reproduction,
++            self.control_mode,
++        );
++        w
++    }
++
++    pub fn content_hash(&self) -> Hash32 {
++        let mut w = CanonWriter::new();
++        w.raw(&self.spec.encode_canonical().expect("spec"));
++        w.raw(&self.state.encode_canonical().expect("state"));
++        w.bool(self.freeze_learning);
++        w.bool(self.disable_reproduction);
++        w.bool(self.disable_active_motion);
++        w.u8(self.control_mode.code());
++        sha256(&w.into_inner())
++    }
++}
++
++pub fn light_right_schedule(spec: &RuleSpec) -> LightingRules {
++    let mut l = spec.lighting.clone();
++    l.left_x0 = 10;
++    l.left_x1 = 12;
++    l.right_x0 = 10;
++    l.right_x1 = 12;
++    l
++}
++
++pub fn close_light_keep_q(spec: &RuleSpec) -> LightingRules {
++    let mut l = spec.lighting.clone();
++    l.y0 = 1;
++    l.y1 = 0;
++    l.radiation_input_per_cell = 0;
++    l
++}
++
++pub fn state_fingerprint(state: &WorldState) -> String {
++    hex_hash(&state_hash(state).expect("state hash"))
++}
+diff --git a/crates/universe_lab/src/lib.rs b/crates/universe_lab/src/lib.rs
+index 22ea96f..c0ef844 100644
+--- a/crates/universe_lab/src/lib.rs
++++ b/crates/universe_lab/src/lib.rs
+@@ -7,6 +7,8 @@ use universe_core::world::World;
+ use universe_types::{BrainState, RuleSpec, PHI, POLICY_LOGITS};
+ 
+ pub mod d1;
++pub mod d2;
++pub mod experiment;
+ 
+ /// Chapter 42.4 readout reversal, one seed.
+ /// Returns last-5k correct-direction fraction and mean last-step fixture reward.
+diff --git a/crates/universe_types/src/error.rs b/crates/universe_types/src/error.rs
+index 41ee4fd..8c05d5d 100644
+--- a/crates/universe_types/src/error.rs
++++ b/crates/universe_types/src/error.rs
+@@ -40,6 +40,8 @@ pub enum SimError {
+     Config(#[from] ConfigError),
+     #[error("safety pause: {0}")]
+     SafetyPause(String),
++    #[error("experiment setup: {0}")]
++    ExperimentSetup(String),
+ }
+ 
+ /// Normal world-internal failures. They do not pause the universe.
+diff --git a/crates/universe_lab/src/experiment.rs b/crates/universe_lab/src/experiment.rs
+index 28b7562..fba5451 100644
+--- a/crates/universe_lab/src/experiment.rs
++++ b/crates/universe_lab/src/experiment.rs
+@@ -1,5 +1,8 @@
+ //! Canonical experiment definition, source identity, and restorable runtime packs.
+ 
++use std::fs;
++use std::path::{Path, PathBuf};
++
+ use universe_core::probe::ControlMode;
+ use universe_core::world::World;
+ use universe_types::{
+@@ -7,6 +10,22 @@ use universe_types::{
+     WorldState,
+ };
+ 
++/// Algorithm id for the file-list execution digest (not `git diff HEAD`).
++pub const SOURCE_DIGEST_ALGO: &str = "eu-source-digest-v1";
++
++/// Workspace paths that can change C5 / lab execution. Results under `docs/`
++/// are excluded so writing artefacts does not invalidate a frozen batch.
++pub const EXECUTION_SOURCE_ROOTS: &[&str] = &[
++    "Cargo.toml",
++    "Cargo.lock",
++    "rust-toolchain.toml",
++    "crates/universe_types",
++    "crates/universe_core",
++    "crates/universe_archive",
++    "crates/universe_lab",
++    "apps/narrator",
++];
++
+ #[derive(Clone, Debug)]
+ pub struct SourceIdentity {
+     pub commit: String,
+@@ -45,6 +64,155 @@ pub fn source_identity() -> SourceIdentity {
+     }
+ }
+ 
++#[derive(Clone, Debug)]
++pub struct SourceFileEntry {
++    pub path: String,
++    pub sha256: String,
++}
++
++#[derive(Clone, Debug)]
++pub struct ExecutionSourceManifest {
++    pub algorithm: String,
++    pub digest: String,
++    pub files: Vec<SourceFileEntry>,
++    pub git_commit: String,
++    pub git_dirty: bool,
++    pub git_porcelain: String,
++    pub execution_source_differs_from_head: bool,
++    pub rustc: String,
++    pub cargo: String,
++}
++
++pub fn workspace_root() -> Result<PathBuf, String> {
++    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++    let crates = manifest
++        .parent()
++        .ok_or_else(|| "universe_lab Cargo.toml has no parent".to_string())?;
++    crates
++        .parent()
++        .ok_or_else(|| "crates/ has no parent".to_string())
++        .map(Path::to_path_buf)
++}
++
++fn skip_dir_name(name: &std::ffi::OsStr) -> bool {
++    name == "target" || name == ".git"
++}
++
++fn collect_rel_paths(root: &Path) -> Result<Vec<String>, String> {
++    let mut out = Vec::new();
++    for rel in EXECUTION_SOURCE_ROOTS {
++        let path = root.join(rel);
++        if !path.exists() {
++            return Err(format!("execution source missing: {rel}"));
++        }
++        if path.is_file() {
++            out.push((*rel).to_string());
++            continue;
++        }
++        let mut stack = vec![path];
++        while let Some(dir) = stack.pop() {
++            let rd = fs::read_dir(&dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
++            for ent in rd {
++                let ent = ent.map_err(|e| e.to_string())?;
++                if skip_dir_name(&ent.file_name()) {
++                    continue;
++                }
++                let p = ent.path();
++                if p.is_dir() {
++                    stack.push(p);
++                } else {
++                    let rel_path = p
++                        .strip_prefix(root)
++                        .map_err(|e| e.to_string())?
++                        .to_string_lossy()
++                        .replace('\\', "/");
++                    if rel_path.starts_with("docs/") {
++                        continue;
++                    }
++                    out.push(rel_path);
++                }
++            }
++        }
++    }
++    out.sort();
++    out.dedup();
++    Ok(out)
++}
++
++fn git_output(args: &[&str], cwd: &Path) -> Result<Vec<u8>, String> {
++    let o = std::process::Command::new("git")
++        .args(args)
++        .current_dir(cwd)
++        .output()
++        .map_err(|e| e.to_string())?;
++    if !o.status.success() {
++        return Err(format!(
++            "git {} failed: {}",
++            args.join(" "),
++            String::from_utf8_lossy(&o.stderr)
++        ));
++    }
++    Ok(o.stdout)
++}
++
++pub fn execution_source_manifest() -> Result<ExecutionSourceManifest, String> {
++    let root = workspace_root()?;
++    let paths = collect_rel_paths(&root)?;
++    let mut files = Vec::with_capacity(paths.len());
++    let mut canon = Vec::new();
++    canon.extend_from_slice(SOURCE_DIGEST_ALGO.as_bytes());
++    canon.push(b'\n');
++    for rel in &paths {
++        let bytes = fs::read(root.join(rel)).map_err(|e| format!("read {rel}: {e}"))?;
++        let h = hex_hash(&sha256(&bytes));
++        canon.extend_from_slice(rel.as_bytes());
++        canon.push(b'\t');
++        canon.extend_from_slice(h.as_bytes());
++        canon.push(b'\n');
++        files.push(SourceFileEntry {
++            path: rel.clone(),
++            sha256: h,
++        });
++    }
++    let digest = hex_hash(&sha256(&canon));
++    let porcelain = String::from_utf8_lossy(&git_output(&["status", "--porcelain"], &root)?)
++        .replace("\r\n", "\n");
++    let mut diff_args = vec!["diff", "--name-only", "HEAD", "--"];
++    diff_args.extend(EXECUTION_SOURCE_ROOTS.iter().copied());
++    let changed = String::from_utf8_lossy(&git_output(&diff_args, &root)?).replace("\r\n", "\n");
++    let mut untracked_args = vec!["ls-files", "--others", "--exclude-standard", "--"];
++    untracked_args.extend(EXECUTION_SOURCE_ROOTS.iter().copied());
++    let untracked =
++        String::from_utf8_lossy(&git_output(&untracked_args, &root)?).replace("\r\n", "\n");
++    let execution_source_differs_from_head =
++        changed.lines().any(|l| !l.is_empty()) || untracked.lines().any(|l| !l.is_empty());
++    let rustc = std::process::Command::new("rustc")
++        .arg("--version")
++        .output()
++        .ok()
++        .and_then(|o| String::from_utf8(o.stdout).ok())
++        .map(|s| s.trim().to_string())
++        .unwrap_or_else(|| "unknown".into());
++    let cargo = std::process::Command::new("cargo")
++        .arg("--version")
++        .output()
++        .ok()
++        .and_then(|o| String::from_utf8(o.stdout).ok())
++        .map(|s| s.trim().to_string())
++        .unwrap_or_else(|| "unknown".into());
++    Ok(ExecutionSourceManifest {
++        algorithm: SOURCE_DIGEST_ALGO.into(),
++        digest,
++        files,
++        git_commit: crate::d1::git_commit(),
++        git_dirty: !porcelain.trim().is_empty(),
++        git_porcelain: porcelain,
++        execution_source_differs_from_head,
++        rustc,
++        cargo,
++    })
++}
++
+ #[derive(Clone, Debug)]
+ pub struct ExperimentDef {
+     pub name: String,
+diff --git a/crates/universe_lab/src/lib.rs b/crates/universe_lab/src/lib.rs
+index c0ef844..0bc4e82 100644
+--- a/crates/universe_lab/src/lib.rs
++++ b/crates/universe_lab/src/lib.rs
+@@ -8,6 +8,7 @@ use universe_types::{BrainState, RuleSpec, PHI, POLICY_LOGITS};
+ 
+ pub mod d1;
+ pub mod d2;
++pub mod d2d;
+ pub mod experiment;
+ 
+ /// Chapter 42.4 readout reversal, one seed.
+warning: in the working copy of 'crates/universe_lab/src/d2d.rs', LF will be replaced by CRLF the next time Git touches it
+diff --git a/crates/universe_lab/src/d2d.rs b/crates/universe_lab/src/d2d.rs
+new file mode 100644
+index 0000000..5962420
+--- /dev/null
++++ b/crates/universe_lab/src/d2d.rs
+@@ -0,0 +1,1185 @@
++//! D2-D campaign: post-fix C5 on seeds 101鈥?20, versioned evidence, no F2.
++
++use std::collections::{BTreeMap, BTreeSet};
++use std::fs;
++use std::io::Write;
++use std::path::Path;
++use std::time::{Instant, SystemTime, UNIX_EPOCH};
++
++use universe_core::init::initialize_reversal_world;
++use universe_core::probe::{budget_p, ControlMode, RunLedger};
++use universe_core::world::World;
++use universe_types::{hex_hash, rules_hash, sha256, state_hash, CanonWriter, RuleSpec, SimError};
++
++use crate::d1::{write_runs_csv, write_windows_csv, RunRow, Scenario, WindowRow, D1_MAX_TICKS, D1_SWITCH_TICK};
++use crate::d2::open_issue_lines;
++use crate::experiment::{
++    execution_source_manifest, light_right_schedule, ExecutionSourceManifest, SOURCE_DIGEST_ALGO,
++};
++use crate::{paired_bootstrap, reversal_spec, REVERSAL_SEEDS};
++
++pub const D2D_STAT_SEED: u64 = 20260910;
++pub const D2D_BOOTSTRAP_DRAWS: usize = 2000;
++pub const D1_C5_MEAN: f64 = 195_084.0;
++pub const D1_C5_LO: f64 = -3_581_658.0;
++pub const D1_C5_HI: f64 = 4_097_096.8;
++
++#[derive(Clone, Debug)]
++pub struct C5Record {
++    pub row: RunRow,
++    pub error_class: Option<String>,
++    pub initial_state_hash: String,
++    pub rules_hash_after_switch: Option<String>,
++    pub p_residual: Option<i128>,
++    pub probe_enabled: bool,
++}
++
++#[derive(Clone, Debug)]
++pub struct PairDiff {
++    pub seed: u64,
++    pub learn_metab_after: u64,
++    pub freeze_metab_after: u64,
++    pub diff: f64,
++    pub learn_alive_switch: bool,
++    pub freeze_alive_switch: bool,
++    pub learn_alive_end: bool,
++    pub freeze_alive_end: bool,
++    pub learn_death_tick: Option<u64>,
++    pub freeze_death_tick: Option<u64>,
++    pub learn_updates: u64,
++    pub freeze_updates: u64,
++    pub learn_decisions: u64,
++    pub freeze_decisions: u64,
++    pub learn_photo: u64,
++    pub freeze_photo: u64,
++}
++
++#[derive(Clone, Debug)]
++pub struct Integrity {
++    pub n_rows: usize,
++    pub n_seeds: usize,
++    pub paired_ok: bool,
++    pub freeze_updates_zero: bool,
++    pub probe_all_off: bool,
++    pub engineering_errors: Vec<String>,
++    pub source_digest_unchanged: bool,
++    pub initial_pairs_ok: bool,
++    pub valid_complete: bool,
++}
++
++#[derive(Clone, Debug)]
++pub struct D2dReport {
++    pub source: ExecutionSourceManifest,
++    pub source_digest_after: String,
++    pub experiment_hash: String,
++    pub rules_hash: String,
++    pub rules_hash_after_switch: String,
++    pub base_rules_hash: String,
++    pub profile: String,
++    pub command: String,
++    pub started_unix: u64,
++    pub elapsed_ms: u128,
++    pub isolation: Isolation,
++    pub records: Vec<C5Record>,
++    pub pairs: Vec<PairDiff>,
++    pub integrity: Integrity,
++    pub mean: Option<f64>,
++    pub lo: Option<f64>,
++    pub hi: Option<f64>,
++    pub conclusion: String,
++}
++
++#[derive(Clone, Debug)]
++pub struct Isolation {
++    pub initial_count: u32,
++    pub disable_reproduction: bool,
++    pub q_loss_divisor: u64,
++    pub substeps: u32,
++    pub decision_every_ticks: u64,
++    pub dt_numerator: u64,
++    pub dt_denominator: u64,
++    pub initial_o_per_cell: u64,
++    pub enable_probe: bool,
++    pub ok: bool,
++    pub notes: Vec<String>,
++}
++
++pub fn campaign_experiment_hash(spec: &RuleSpec) -> [u8; 32] {
++    let mut w = CanonWriter::new();
++    w.raw(b"EUD2D");
++    w.u32(1);
++    w.raw(&spec.encode_canonical().expect("reversal spec"));
++    let after = light_right_schedule(spec);
++    w.u32(after.left_x0);
++    w.u32(after.left_x1);
++    w.u32(after.right_x0);
++    w.u32(after.right_x1);
++    w.u32(after.y0);
++    w.u32(after.y1);
++    w.u64(D1_SWITCH_TICK);
++    w.u64(D1_MAX_TICKS);
++    w.u64(REVERSAL_SEEDS.len() as u64);
++    for s in REVERSAL_SEEDS {
++        w.u64(s);
++    }
++    w.raw(b"C5-learn+C5-freeze");
++    w.u8(0);
++    w.bool(false); // enable_probe
++    w.bool(true); // disable_reproduction
++    w.raw(b"metab_e_after_switch");
++    w.u8(0);
++    w.u64(D2D_STAT_SEED);
++    w.u64(D2D_BOOTSTRAP_DRAWS as u64);
++    w.raw(b"P=E+8C");
++    w.u8(0);
++    w.bool(true); // apply_lighting
++    sha256(&w.into_inner())
++}
++
++pub fn check_isolation(spec: &RuleSpec) -> Isolation {
++    let mut notes = Vec::new();
++    let mut ok = true;
++    if spec.init.initial_count != 1 {
++        ok = false;
++        notes.push(format!(
++            "initial_count={} (need 1 for R08 isolation)",
++            spec.init.initial_count
++        ));
++    }
++    if spec.world.q_loss_divisor == 0 {
++        ok = false;
++        notes.push("q_loss_divisor=0 is not a verified C5 config".into());
++    }
++    if spec.physics.substeps == 0 {
++        ok = false;
++        notes.push("substeps=0 is not a verified C5 config".into());
++    }
++    if spec.time.decision_every_ticks != 5
++        || spec.time.dt_numerator != 1
++        || spec.time.dt_denominator != 10
++    {
++        ok = false;
++        notes.push("time step / decision interval is not the verified lab combo".into());
++    }
++    notes.push(format!(
++        "EX03 coverage this round: non-empty future_inputs only; q_loss_divisor=0/substeps=0 not claimed rejected"
++    ));
++    Isolation {
++        initial_count: spec.init.initial_count,
++        disable_reproduction: true,
++        q_loss_divisor: spec.world.q_loss_divisor,
++        substeps: spec.physics.substeps,
++        decision_every_ticks: spec.time.decision_every_ticks,
++        dt_numerator: spec.time.dt_numerator,
++        dt_denominator: spec.time.dt_denominator,
++        initial_o_per_cell: spec.init.initial_o_per_cell,
++        enable_probe: false,
++        ok,
++        notes,
++    }
++}
++
++/// Diagnostic P identity from the D2-D prompt. Residual 0 is not required for
++/// batch validity; a non-zero residual must be explained, not fitted.
++pub fn p_identity_residual(l: &RunLedger) -> Option<i128> {
++    let p0 = l.p_initial? as i128;
++    let p1 = l.p_before_death_or_end? as i128;
++    let rhs = 8i128
++        .saturating_mul(i128::from(l.photo_extent).saturating_add(i128::from(l.uptake_o)))
++        .saturating_sub(i128::from(l.maint_paid))
++        .saturating_sub(i128::from(l.cognition))
++        .saturating_sub(i128::from(l.thrust_attempt))
++        .saturating_sub(i128::from(l.turn_attempt))
++        .saturating_sub(i128::from(l.debt_repay));
++    Some(p1.saturating_sub(p0).saturating_sub(rhs))
++}
++
++pub fn classify_sim_error(e: &SimError) -> &'static str {
++    match e {
++        SimError::SafetyPause(_) => "SafetyPause",
++        SimError::Numeric(_) => "NumericFault",
++        SimError::ExperimentSetup(_) => "ExperimentSetup",
++        SimError::ArchiveFailure(_) => "ArchiveFailure",
++        SimError::RuleViolation(_) => "RuleViolation",
++        SimError::Config(_) => "Config",
++    }
++}
++
++fn in_lit(spec: &RuleSpec, x: f64, y: f64) -> bool {
++    let gx = x.floor();
++    let gy = y.floor();
++    if gx < 0.0 || gy < 0.0 {
++        return false;
++    }
++    spec.lighting.is_lit(gx as u32, gy as u32)
++}
++
++fn alive_at_switch(row: &RunRow) -> bool {
++    match (row.scenario.switch_tick, row.ledger.death_tick) {
++        (None, _) => false,
++        (Some(sw), None) => row.alive_at_end || row.ledger.executed_ticks >= sw,
++        (Some(sw), Some(d)) => d >= sw,
++    }
++}
++
++fn c5_scenario(seed: u64, freeze: bool) -> Scenario {
++    Scenario {
++        group: if freeze {
++            "C5-freeze".into()
++        } else {
++            "C5-learn".into()
++        },
++        seed,
++        freeze_learning: freeze,
++        control: ControlMode::Neural,
++        switch_tick: Some(D1_SWITCH_TICK),
++        max_ticks: D1_MAX_TICKS,
++        place: None,
++        heading: None,
++        dark: false,
++        collect_decisions: false,
++    }
++}
++
++pub fn initial_state_hash(seed: u64) -> Result<String, String> {
++    let spec = reversal_spec();
++    let st = initialize_reversal_world(&spec, seed).map_err(|e| e.to_string())?;
++    Ok(hex_hash(&state_hash(&st).map_err(|e| e.to_string())?))
++}
++
++pub fn run_c5_scenario(
++    sc: Scenario,
++    experiment_hex: &str,
++    commit: &str,
++    rules_hex: &str,
++) -> C5Record {
++    let spec = reversal_spec();
++    let st = initialize_reversal_world(&spec, sc.seed).expect("init");
++    let initial_state_hash = hex_hash(&state_hash(&st).expect("state hash"));
++    let mut w = World::from_state(spec, st);
++    w.freeze_learning = sc.freeze_learning;
++    w.disable_reproduction = true;
++    w.control_mode = sc.control;
++    w.enable_probe = false;
++    let initial_q = w.state.fields.q.iter().copied().sum();
++
++    let mut row = RunRow {
++        scenario: sc.clone(),
++        ledger: RunLedger::default(),
++        rules_hash: rules_hex.to_string(),
++        experiment_hash: experiment_hex.to_string(),
++        commit: commit.to_string(),
++        windows: Vec::new(),
++        path: Vec::new(),
++        decisions: Vec::new(),
++        alive_at_end: false,
++        final_x: 0.0,
++        final_y: 0.0,
++        entered_old: false,
++        entered_new: false,
++        c0_pass: None,
++        error: None,
++        initial_q,
++    };
++
++    let mut photo_mark = 0u64;
++    let mut o_mark = 0u64;
++    let mut metab_mark = 0u64;
++    let mut switched = false;
++    let mut error_class = None;
++    let mut rules_hash_after_switch = None;
++
++    for t in 0..sc.max_ticks {
++        if sc.switch_tick == Some(t) {
++            if let Some(org) = w.state.organisms.iter().find(|o| !o.marked_dead) {
++                w.run_ledger.p_at_switch = Some(budget_p(
++                    org.accounts.e_old,
++                    org.accounts.e_new,
++                    org.accounts.c,
++                ));
++                w.run_ledger.e_at_switch = Some(org.accounts.e_old);
++                w.run_ledger.c_at_switch = Some(org.accounts.c);
++                w.run_ledger.n_at_switch = Some(org.accounts.n);
++                w.run_ledger.debt_at_switch = Some(org.maintenance_debt);
++            }
++            photo_mark = w.run_ledger.photo_extent;
++            o_mark = w.run_ledger.uptake_o;
++            metab_mark = w.run_ledger.metab_e_new;
++            match w.apply_lighting(light_right_schedule(&w.spec)) {
++                Ok(()) => {
++                    rules_hash_after_switch = Some(hex_hash(&w.state.rules_hash));
++                    switched = true;
++                }
++                Err(e) => {
++                    error_class = Some(classify_sim_error(&e).into());
++                    row.error = Some(e.to_string());
++                    break;
++                }
++            }
++        }
++        if w.state.organisms.is_empty() {
++            break;
++        }
++        match w.step() {
++            Ok(()) => {}
++            Err(e) => {
++                error_class = Some(classify_sim_error(&e).into());
++                row.error = Some(e.to_string());
++                break;
++            }
++        }
++        if let Some(org) = w.state.organisms.first() {
++            let x = org.geom.x;
++            let y = org.geom.y;
++            if in_lit(&w.spec, x, y) {
++                if !switched {
++                    if w.run_ledger.first_old_light_entry.is_none() {
++                        w.run_ledger.first_old_light_entry = Some(w.state.tick);
++                    }
++                    w.run_ledger.old_light_residence_before =
++                        w.run_ledger.old_light_residence_before.saturating_add(1);
++                    row.entered_old = true;
++                } else {
++                    if w.run_ledger.first_new_light_entry.is_none() {
++                        w.run_ledger.first_new_light_entry = Some(w.state.tick);
++                    }
++                    w.run_ledger.new_light_residence_after =
++                        w.run_ledger.new_light_residence_after.saturating_add(1);
++                    row.entered_new = true;
++                }
++            }
++            row.final_x = x;
++            row.final_y = y;
++            if t % 100 == 99 || t + 1 == sc.max_ticks {
++                row.windows.push(WindowRow {
++                    tick: w.state.tick,
++                    group: sc.group.clone(),
++                    seed: sc.seed,
++                    e: org.accounts.e_old,
++                    c: org.accounts.c,
++                    n: org.accounts.n,
++                    p: budget_p(org.accounts.e_old, org.accounts.e_new, org.accounts.c),
++                    photo: w.run_ledger.photo_extent,
++                    uptake_o: w.run_ledger.uptake_o,
++                    metab_e: w.run_ledger.metab_e_new,
++                    maint: w.run_ledger.maint_paid,
++                    cog: w.run_ledger.cognition,
++                    thrust: w.run_ledger.thrust_attempt,
++                    turn: w.run_ledger.turn_attempt,
++                    x,
++                    y,
++                    living: 1,
++                });
++            }
++        } else {
++            row.windows.push(WindowRow {
++                tick: w.state.tick,
++                group: sc.group.clone(),
++                seed: sc.seed,
++                e: 0,
++                c: 0,
++                n: 0,
++                p: 0,
++                photo: w.run_ledger.photo_extent,
++                uptake_o: w.run_ledger.uptake_o,
++                metab_e: w.run_ledger.metab_e_new,
++                maint: w.run_ledger.maint_paid,
++                cog: w.run_ledger.cognition,
++                thrust: w.run_ledger.thrust_attempt,
++                turn: w.run_ledger.turn_attempt,
++                x: row.final_x,
++                y: row.final_y,
++                living: 0,
++            });
++            break;
++        }
++    }
++
++    if switched {
++        w.run_ledger.photo_before_switch = photo_mark;
++        w.run_ledger.photo_after_switch = w.run_ledger.photo_extent.saturating_sub(photo_mark);
++        w.run_ledger.uptake_o_before_switch = o_mark;
++        w.run_ledger.uptake_o_after_switch = w.run_ledger.uptake_o.saturating_sub(o_mark);
++        w.run_ledger.metab_e_before_switch = metab_mark;
++        w.run_ledger.metab_e_after_switch = w.run_ledger.metab_e_new.saturating_sub(metab_mark);
++    } else {
++        w.run_ledger.photo_before_switch = w.run_ledger.photo_extent;
++        w.run_ledger.uptake_o_before_switch = w.run_ledger.uptake_o;
++        w.run_ledger.metab_e_before_switch = w.run_ledger.metab_e_new;
++    }
++
++    row.alive_at_end = !w.state.organisms.is_empty();
++    if let Some(org) = w.state.organisms.first() {
++        row.final_x = org.geom.x;
++        row.final_y = org.geom.y;
++        if w.run_ledger.p_before_death_or_end.is_none() {
++            w.run_ledger.p_before_death_or_end = Some(budget_p(
++                org.accounts.e_old,
++                org.accounts.e_new,
++                org.accounts.c,
++            ));
++        }
++    }
++    debug_assert!(!w.enable_probe);
++    debug_assert!(w.last_decisions.is_empty());
++    row.ledger = w.run_ledger.clone();
++    let p_residual = p_identity_residual(&row.ledger);
++    C5Record {
++        probe_enabled: w.enable_probe,
++        row,
++        error_class,
++        initial_state_hash,
++        rules_hash_after_switch,
++        p_residual,
++    }
++}
++
++pub fn pair_by_seed(records: &[C5Record]) -> Result<Vec<PairDiff>, String> {
++    let mut learn: BTreeMap<u64, &C5Record> = BTreeMap::new();
++    let mut freeze: BTreeMap<u64, &C5Record> = BTreeMap::new();
++    for r in records {
++        match r.row.scenario.group.as_str() {
++            "C5-learn" => {
++                if learn.insert(r.row.scenario.seed, r).is_some() {
++                    return Err(format!("duplicate C5-learn seed {}", r.row.scenario.seed));
++                }
++            }
++            "C5-freeze" => {
++                if freeze.insert(r.row.scenario.seed, r).is_some() {
++                    return Err(format!("duplicate C5-freeze seed {}", r.row.scenario.seed));
++                }
++            }
++            other => return Err(format!("unexpected group {other}")),
++        }
++    }
++    let seeds: BTreeSet<u64> = learn.keys().copied().collect();
++    if seeds.len() != REVERSAL_SEEDS.len() {
++        return Err(format!(
++            "learn seeds {} != {}",
++            seeds.len(),
++            REVERSAL_SEEDS.len()
++        ));
++    }
++    for s in REVERSAL_SEEDS {
++        if !seeds.contains(&s) {
++            return Err(format!("missing learn seed {s}"));
++        }
++        if !freeze.contains_key(&s) {
++            return Err(format!("missing freeze seed {s}"));
++        }
++    }
++    let mut pairs = Vec::new();
++    for s in REVERSAL_SEEDS {
++        let l = learn[&s];
++        let f = freeze[&s];
++        if l.initial_state_hash != f.initial_state_hash {
++            return Err(format!(
++                "seed {s} learn/freeze initial state_hash differ"
++            ));
++        }
++        let ld = l.row.ledger.metab_e_after_switch;
++        let fd = f.row.ledger.metab_e_after_switch;
++        pairs.push(PairDiff {
++            seed: s,
++            learn_metab_after: ld,
++            freeze_metab_after: fd,
++            diff: ld as f64 - fd as f64,
++            learn_alive_switch: alive_at_switch(&l.row),
++            freeze_alive_switch: alive_at_switch(&f.row),
++            learn_alive_end: l.row.alive_at_end,
++            freeze_alive_end: f.row.alive_at_end,
++            learn_death_tick: l.row.ledger.death_tick,
++            freeze_death_tick: f.row.ledger.death_tick,
++            learn_updates: l.row.ledger.learning_update_count,
++            freeze_updates: f.row.ledger.learning_update_count,
++            learn_decisions: l.row.ledger.decision_count,
++            freeze_decisions: f.row.ledger.decision_count,
++            learn_photo: l.row.ledger.photo_extent,
++            freeze_photo: f.row.ledger.photo_extent,
++        });
++    }
++    Ok(pairs)
++}
++
++fn json_escape(s: &str) -> String {
++    s.replace('\\', "\\\\")
++        .replace('"', "\\\"")
++        .replace('\n', "\\n")
++        .replace('\r', "\\r")
++        .replace('\t', "\\t")
++}
++
++pub fn run_d2d_campaign(out_dir: impl AsRef<Path>) -> Result<D2dReport, String> {
++    let out = out_dir.as_ref();
++    fs::create_dir_all(out).map_err(|e| e.to_string())?;
++    let started = Instant::now();
++    let started_unix = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .unwrap_or(0);
++    let source = execution_source_manifest()?;
++    let spec = reversal_spec();
++    let isolation = check_isolation(&spec);
++    if !isolation.ok {
++        return Err(format!("C5 isolation blocked: {:?}", isolation.notes));
++    }
++    let rules_hex = hex_hash(&rules_hash(&spec).map_err(|e| e.to_string())?);
++    let mut spec_after = spec.clone();
++    spec_after.lighting = light_right_schedule(&spec);
++    let rules_after = hex_hash(&rules_hash(&spec_after).map_err(|e| e.to_string())?);
++    let experiment_hex = hex_hash(&campaign_experiment_hash(&spec));
++    let base_rules = hex_hash(&rules_hash(&RuleSpec::eu_core_1()).map_err(|e| e.to_string())?);
++    let profile = if cfg!(debug_assertions) {
++        "debug"
++    } else {
++        "release"
++    };
++    let command = format!(
++        "cargo run --release --offline -p universe_lab --bin d2d -- {}",
++        out.display()
++    );
++
++    write_source_manifest(out, &source)?;
++    write_start_identity(out, &source, &experiment_hex, &rules_hex, &rules_after, profile, &command, started_unix)?;
++
++    let mut records = Vec::new();
++    for seed in REVERSAL_SEEDS {
++        let h_learn = initial_state_hash(seed)?;
++        let h_freeze = initial_state_hash(seed)?;
++        if h_learn != h_freeze {
++            return Err(format!("seed {seed} reconstructed initial hashes differ"));
++        }
++        eprintln!("D2-D C5-learn seed {seed}");
++        records.push(run_c5_scenario(
++            c5_scenario(seed, false),
++            &experiment_hex,
++            &source.git_commit,
++            &rules_hex,
++        ));
++        eprintln!("D2-D C5-freeze seed {seed}");
++        records.push(run_c5_scenario(
++            c5_scenario(seed, true),
++            &experiment_hex,
++            &source.git_commit,
++            &rules_hex,
++        ));
++    }
++
++    let after = execution_source_manifest()?;
++    let digest_unchanged = after.digest == source.digest;
++    if !digest_unchanged {
++        fs::write(
++            out.join("BATCH_INVALID.txt"),
++            format!(
++                "source_digest changed during the batch\nbefore={}\nafter={}\n",
++                source.digest, after.digest
++            ),
++        )
++        .map_err(|e| e.to_string())?;
++    }
++
++    let engineering_errors: Vec<String> = records
++        .iter()
++        .filter(|r| r.error_class.is_some() || r.row.error.is_some())
++        .map(|r| {
++            format!(
++                "{} seed {} class={} err={}",
++                r.row.scenario.group,
++                r.row.scenario.seed,
++                r.error_class.as_deref().unwrap_or("?"),
++                r.row.error.as_deref().unwrap_or("")
++            )
++        })
++        .collect();
++
++    let pair_res = pair_by_seed(&records);
++    let (pairs, paired_ok) = match pair_res {
++        Ok(p) => (p, true),
++        Err(e) => {
++            engineering_errors_note(out, &e)?;
++            (Vec::new(), false)
++        }
++    };
++    let freeze_updates_zero = records
++        .iter()
++        .filter(|r| r.row.scenario.group == "C5-freeze")
++        .all(|r| r.row.ledger.learning_update_count == 0);
++    let probe_all_off = records.iter().all(|r| !r.probe_enabled);
++    let initial_pairs_ok = paired_ok
++        && pairs.iter().all(|p| {
++            records
++                .iter()
++                .filter(|r| r.row.scenario.seed == p.seed)
++                .map(|r| r.initial_state_hash.as_str())
++                .collect::<BTreeSet<_>>()
++                .len()
++                == 1
++        });
++
++    let valid_complete = digest_unchanged
++        && paired_ok
++        && records.len() == 40
++        && engineering_errors.is_empty()
++        && freeze_updates_zero
++        && probe_all_off
++        && initial_pairs_ok
++        && isolation.ok;
++
++    let (mean, lo, hi, conclusion) = if valid_complete {
++        let diffs: Vec<f64> = pairs.iter().map(|p| p.diff).collect();
++        let (m, l, h) = paired_bootstrap(&diffs, D2D_STAT_SEED, D2D_BOOTSTRAP_DRAWS);
++        let text = if l <= 0.0 && h >= 0.0 {
++            "灏氭湭瑙傚療鍒板彲闈犳敹鐩?.to_string()
++        } else {
++            "褰撳墠 C5 鍚庡崐绋嬩唬璋?E 鎸囨爣涓婂涔犫垝鍐荤粨鐨?95% 鍖洪棿涓嶈法闆讹紱杩欏彧鏄鎸囨爣鍦ㄦ湰鍗忚涓嬬殑宸紓锛屼笉鏄?F2銆佺敓鎬佸鏉傚寲鎴栨劅鎯呭舰鎴愰€氳繃銆?.to_string()
++        };
++        (Some(m), Some(l), Some(h), text)
++    } else {
++        (
++            None,
++            None,
++            None,
++            "鏈壒娆′笉寰楃敓鎴愭湁鏁堝畬鎴愮殑涓荤粺璁＄粨璁恒€?.to_string(),
++        )
++    };
++
++    let n_rows = records.len();
++    let report = D2dReport {
++        source,
++        source_digest_after: after.digest,
++        experiment_hash: experiment_hex,
++        rules_hash: rules_hex,
++        rules_hash_after_switch: rules_after,
++        base_rules_hash: base_rules,
++        profile: profile.into(),
++        command,
++        started_unix,
++        elapsed_ms: started.elapsed().as_millis(),
++        isolation,
++        records,
++        pairs,
++        integrity: Integrity {
++            n_rows,
++            n_seeds: REVERSAL_SEEDS.len(),
++            paired_ok,
++            freeze_updates_zero,
++            probe_all_off,
++            engineering_errors,
++            source_digest_unchanged: digest_unchanged,
++            initial_pairs_ok,
++            valid_complete,
++        },
++        mean,
++        lo,
++        hi,
++        conclusion,
++    };
++
++    write_d2d_artefacts(out, &report)?;
++    append_versions_elapsed(out, report.elapsed_ms, report.integrity.valid_complete)?;
++    if !digest_unchanged {
++        return Err("source_digest changed during the batch; marked invalid".into());
++    }
++    Ok(report)
++}
++
++fn append_versions_elapsed(out: &Path, elapsed_ms: u128, valid: bool) -> Result<(), String> {
++    let extra = format!("elapsed_ms={elapsed_ms}\nvalid_complete={valid}\n");
++    fs::OpenOptions::new()
++        .append(true)
++        .open(out.join("versions.txt"))
++        .and_then(|mut f| f.write_all(extra.as_bytes()))
++        .map_err(|e| e.to_string())
++}
++
++fn engineering_errors_note(out: &Path, msg: &str) -> Result<(), String> {
++    fs::write(out.join("pair_error.txt"), msg).map_err(|e| e.to_string())
++}
++
++fn write_start_identity(
++    out: &Path,
++    source: &ExecutionSourceManifest,
++    experiment_hex: &str,
++    rules_hex: &str,
++    rules_after: &str,
++    profile: &str,
++    command: &str,
++    started_unix: u64,
++) -> Result<(), String> {
++    let mut v = String::new();
++    v.push_str(&format!("campaign=D2-D\n"));
++    v.push_str(&format!("git_commit={}\n", source.git_commit));
++    v.push_str(&format!("git_dirty={}\n", source.git_dirty));
++    v.push_str(&format!(
++        "execution_source_differs_from_head={}\n",
++        source.execution_source_differs_from_head
++    ));
++    v.push_str(&format!("source_digest_algo={}\n", SOURCE_DIGEST_ALGO));
++    v.push_str(&format!("source_digest={}\n", source.digest));
++    v.push_str(&format!("source_digest_at=start\n"));
++    v.push_str(&format!("rustc={}\n", source.rustc));
++    v.push_str(&format!("cargo={}\n", source.cargo));
++    v.push_str(&format!("profile={profile}\n"));
++    v.push_str(&format!("command={command}\n"));
++    v.push_str(&format!("started_unix={started_unix}\n"));
++    v.push_str(&format!("experiment_hash={experiment_hex}\n"));
++    v.push_str(&format!("rules_hash={rules_hex}\n"));
++    v.push_str(&format!("rules_hash_after_switch={rules_after}\n"));
++    v.push_str("learning_rates_unchanged=true\n");
++    v.push_str("reward_coeffs_unchanged=true\n");
++    v.push_str("network_size_unchanged=true\n");
++    v.push_str("docs_d1_preserved=true\n");
++    v.push_str("docs_batches_G5_preserved=true\n");
++    v.push_str("f2_not_run=true\n");
++    v.push_str("enable_probe=false\n");
++    v.push_str("seeds=101-120\n");
++    v.push_str(&format!("switch_tick={}\n", D1_SWITCH_TICK));
++    v.push_str(&format!("max_ticks={}\n", D1_MAX_TICKS));
++    v.push_str(&format!("stat_seed={}\n", D2D_STAT_SEED));
++    v.push_str(&format!("bootstrap_draws={}\n", D2D_BOOTSTRAP_DRAWS));
++    fs::write(out.join("versions.txt"), v).map_err(|e| e.to_string())?;
++    fs::write(out.join("git_status_at_start.txt"), &source.git_porcelain)
++        .map_err(|e| e.to_string())?;
++    Ok(())
++}
++
++fn write_source_manifest(out: &Path, source: &ExecutionSourceManifest) -> Result<(), String> {
++    let mut s = String::new();
++    s.push_str("{\n");
++    s.push_str(&format!(
++        "  \"algorithm\": \"{}\",\n",
++        json_escape(&source.algorithm)
++    ));
++    s.push_str(&format!("  \"digest\": \"{}\",\n", source.digest));
++    s.push_str(&format!("  \"n_files\": {},\n", source.files.len()));
++    s.push_str("  \"files\": [\n");
++    for (i, f) in source.files.iter().enumerate() {
++        s.push_str(&format!(
++            "    {{\"path\": \"{}\", \"sha256\": \"{}\"}}{}",
++            json_escape(&f.path),
++            f.sha256,
++            if i + 1 == source.files.len() {
++                "\n"
++            } else {
++                ",\n"
++            }
++        ));
++    }
++    s.push_str("  ]\n}\n");
++    fs::write(out.join("source_manifest.json"), s).map_err(|e| e.to_string())
++}
++
++fn write_d2d_artefacts(out: &Path, report: &D2dReport) -> Result<(), String> {
++    let rows: Vec<RunRow> = report.records.iter().map(|r| r.row.clone()).collect();
++    write_runs_csv(&out.join("runs.csv"), &rows).map_err(|e| e.to_string())?;
++    write_windows_csv(&out.join("windows.csv"), &rows).map_err(|e| e.to_string())?;
++    write_pairs_csv(out, report)?;
++    write_statistics_json(out, report)?;
++    write_manifest_json(out, report)?;
++    write_sampling(out)?;
++    write_open_issues(out, report)?;
++    write_report_md(out, report)?;
++    Ok(())
++}
++
++fn write_pairs_csv(out: &Path, report: &D2dReport) -> Result<(), String> {
++    let mut f = fs::File::create(out.join("paired_differences.csv")).map_err(|e| e.to_string())?;
++    writeln!(
++        f,
++        "seed,learn_metab_after,freeze_metab_after,diff,learn_alive_switch,freeze_alive_switch,learn_alive_end,freeze_alive_end,learn_death_tick,freeze_death_tick,learn_updates,freeze_updates,learn_decisions,freeze_decisions,learn_photo,freeze_photo"
++    )
++    .map_err(|e| e.to_string())?;
++    for p in &report.pairs {
++        writeln!(
++            f,
++            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{},{},{}",
++            p.seed,
++            p.learn_metab_after,
++            p.freeze_metab_after,
++            p.diff,
++            u8::from(p.learn_alive_switch),
++            u8::from(p.freeze_alive_switch),
++            u8::from(p.learn_alive_end),
++            u8::from(p.freeze_alive_end),
++            p.learn_death_tick.map(|x| x.to_string()).unwrap_or_default(),
++            p.freeze_death_tick.map(|x| x.to_string()).unwrap_or_default(),
++            p.learn_updates,
++            p.freeze_updates,
++            p.learn_decisions,
++            p.freeze_decisions,
++            p.learn_photo,
++            p.freeze_photo
++        )
++        .map_err(|e| e.to_string())?;
++    }
++    Ok(())
++}
++
++fn write_statistics_json(out: &Path, report: &D2dReport) -> Result<(), String> {
++    let mut s = String::new();
++    s.push_str("{\n");
++    s.push_str(&format!(
++        "  \"valid_complete\": {},\n",
++        report.integrity.valid_complete
++    ));
++    s.push_str(&format!(
++        "  \"metric\": \"metab_e_after_switch learn-minus-freeze\",\n"
++    ));
++    s.push_str(&format!("  \"stat_seed\": {},\n", D2D_STAT_SEED));
++    s.push_str(&format!("  \"bootstrap_draws\": {},\n", D2D_BOOTSTRAP_DRAWS));
++    s.push_str("  \"resample_unit\": \"complete seed pair\",\n");
++    s.push_str("  \"quantile\": \"lo=means[(0.025*draws) as usize], hi=means[((0.975*draws) as usize).min(draws-1)] after sort\",\n");
++    match (report.mean, report.lo, report.hi) {
++        (Some(m), Some(l), Some(h)) => {
++            s.push_str(&format!("  \"mean\": {m:.1},\n"));
++            s.push_str(&format!("  \"ci95_lo\": {l:.1},\n"));
++            s.push_str(&format!("  \"ci95_hi\": {h:.1},\n"));
++        }
++        _ => {
++            s.push_str("  \"mean\": null,\n");
++            s.push_str("  \"ci95_lo\": null,\n");
++            s.push_str("  \"ci95_hi\": null,\n");
++        }
++    }
++    s.push_str(&format!(
++        "  \"d1_reference_mean\": {},\n",
++        D1_C5_MEAN
++    ));
++    s.push_str(&format!("  \"d1_reference_ci95_lo\": {},\n", D1_C5_LO));
++    s.push_str(&format!("  \"d1_reference_ci95_hi\": {},\n", D1_C5_HI));
++    s.push_str(&format!(
++        "  \"learn_alive_switch\": {},\n",
++        report.pairs.iter().filter(|p| p.learn_alive_switch).count()
++    ));
++    s.push_str(&format!(
++        "  \"freeze_alive_switch\": {},\n",
++        report.pairs.iter().filter(|p| p.freeze_alive_switch).count()
++    ));
++    s.push_str(&format!(
++        "  \"learn_alive_end\": {},\n",
++        report.pairs.iter().filter(|p| p.learn_alive_end).count()
++    ));
++    s.push_str(&format!(
++        "  \"freeze_alive_end\": {},\n",
++        report.pairs.iter().filter(|p| p.freeze_alive_end).count()
++    ));
++    s.push_str("  \"p_residuals\": [\n");
++    for (i, r) in report.records.iter().enumerate() {
++        s.push_str(&format!(
++            "    {{\"seed\": {}, \"group\": \"{}\", \"residual\": {}}}{}",
++            r.row.scenario.seed,
++            r.row.scenario.group,
++            r.p_residual
++                .map(|x| x.to_string())
++                .unwrap_or_else(|| "null".into()),
++            if i + 1 == report.records.len() {
++                "\n"
++            } else {
++                ",\n"
++            }
++        ));
++    }
++    s.push_str("  ],\n");
++    s.push_str("  \"pairs\": [\n");
++    for (i, p) in report.pairs.iter().enumerate() {
++        s.push_str(&format!(
++            "    {{\"seed\": {}, \"diff\": {:.1}}}{}",
++            p.seed,
++            p.diff,
++            if i + 1 == report.pairs.len() {
++                "\n"
++            } else {
++                ",\n"
++            }
++        ));
++    }
++    s.push_str("  ]\n}\n");
++    fs::write(out.join("statistics.json"), s).map_err(|e| e.to_string())
++}
++
++fn write_manifest_json(out: &Path, report: &D2dReport) -> Result<(), String> {
++    let status = if report.integrity.valid_complete {
++        "c5_complete"
++    } else {
++        "invalid_or_incomplete"
++    };
++    let body = format!(
++        "{{\n  \"campaign\": \"D2-D\",\n  \"commit\": \"{}\",\n  \"git_dirty\": {},\n  \"execution_source_differs_from_head\": {},\n  \"source_digest_algo\": \"{}\",\n  \"source_digest\": \"{}\",\n  \"source_digest_after\": \"{}\",\n  \"source_digest_unchanged\": {},\n  \"rustc\": \"{}\",\n  \"cargo\": \"{}\",\n  \"profile\": \"{}\",\n  \"command\": \"{}\",\n  \"experiment_hash\": \"{}\",\n  \"rules_hash\": \"{}\",\n  \"rules_hash_after_switch\": \"{}\",\n  \"base_rules_hash_128\": \"{}\",\n  \"switch_tick\": {},\n  \"max_ticks\": {},\n  \"seeds\": {:?},\n  \"enable_probe\": false,\n  \"p_definition\": \"P = E_old + E_new + 8*C (micro-units)\",\n  \"map\": \"reversal_16x16\",\n  \"status\": \"{}\",\n  \"note\": \"Historical D2 short results in docs/d2/ keep their original 4f237b0 dirty identity. This directory is the D2-D run.\"\n}}\n",
++        json_escape(&report.source.git_commit),
++        report.source.git_dirty,
++        report.source.execution_source_differs_from_head,
++        SOURCE_DIGEST_ALGO,
++        report.source.digest,
++        report.source_digest_after,
++        report.integrity.source_digest_unchanged,
++        json_escape(&report.source.rustc),
++        json_escape(&report.source.cargo),
++        report.profile,
++        json_escape(&report.command),
++        report.experiment_hash,
++        report.rules_hash,
++        report.rules_hash_after_switch,
++        report.base_rules_hash,
++        D1_SWITCH_TICK,
++        D1_MAX_TICKS,
++        REVERSAL_SEEDS,
++        status
++    );
++    fs::write(out.join("manifest.json"), body).map_err(|e| e.to_string())
++}
++
++fn write_sampling(out: &Path) -> Result<(), String> {
++    let text = "\
++# D2-D 閲囨牱棰勭畻锛堥鍏堝０鏄庯紝涓嶄簨鍚庢寫閫夛級
++
++- 瀹屾暣 C5锛?0 鏉¤繍琛屽叏閮?`enable_probe=false`銆備富缁熻涓?runs.csv 鍙娇鐢?`RunLedger` 璐︽湰锛屼笉淇濈暀鏃犵晫 `last_decisions`銆?+- 鐭鐓э細`cargo run --offline -p universe_lab --bin d2 -- <run>/short`銆傞鍏堟寚瀹氱敤渚?FB01/EX02/AR02/R04-dark/MV04-unit锛屽崟浣擄紝H鈮?2銆傜煭瀵圭収鑻?`enable_probe=true`锛岀紦瀛樼敱鏈夐檺 H 涓庡崟涓€涓綋闄愬埗銆?+- 涓嶆牴鎹?C5 缁撴灉鍐嶅鍑洪澶栧喅绛栧抚銆?+- 鍐荤粨缁勬甯告劅鐭ャ€佹娊鏍枫€佽鍔ㄥ苟鏀粯璁ょ煡璐癸紱鍙叧闂湪绾胯鍑烘洿鏂般€?+";
++    fs::write(out.join("sampling.md"), text).map_err(|e| e.to_string())
++}
++
++fn write_open_issues(out: &Path, report: &D2dReport) -> Result<(), String> {
++    let mut s = String::from("# D2-D 鏈В鍐抽棶棰榎n\n");
++    s.push_str("## 鏈疆瀹為檯闅旂\n\n");
++    s.push_str(&format!(
++        "- R08锛歚initial_count={}`锛屽崟浣擄紝鏃犲叡浜祫婧愮珵浜夛紱鏈獙璇佸浣?QuotaTie銆俓n",
++        report.isolation.initial_count
++    ));
++    s.push_str(&format!(
++        "- R09锛歚disable_reproduction={}`锛屾湭娉ㄥ叆鎹熶激锛況epair 浠嶆湭鎺ュ叆涓栫晫姝ヨ繘銆傚嚭鐢熷綋姝ュ弽棣堟湭娴嬨€侫T02/AT03 鏈窇銆俓n",
++        report.isolation.disable_reproduction
++    ));
++    s.push_str(&format!(
++        "- R10锛氭湰杞厤缃?`q_loss_divisor={}`銆乣substeps={}`銆乨t={}/{}銆乣decision_every_ticks={}`銆侲X03 浠呰鐩栭潪绌?future_inputs锛屼笉鑳藉绉伴浂闄ゆ暟绛夊叏閮ㄨ鎷掔粷銆俓n",
++        report.isolation.q_loss_divisor,
++        report.isolation.substeps,
++        report.isolation.dt_numerator,
++        report.isolation.dt_denominator,
++        report.isolation.decision_every_ticks
++    ));
++    s.push_str("- R11锛氬畬鏁?C5 `enable_probe=false`锛屼笉鎶婃棤鐣?`last_decisions` 鐢ㄤ簬闀胯繍琛屻€傚唴鏍告棤鐣屾帰閽?API 鏈敼锛涙湁鐣屾帰閽堜粛鏄悗缁己闄枫€傜煭瀵圭収瑙?`sampling.md`銆俓n");
++    s.push_str("- 妗ｆ锛氭湰杞?C5 涓嶄娇鐢ㄦ。妗堟仮澶嶃€傜幇鏈夋祴璇曡鐩?S0銆佷簨浠跺箓绛夈€乺ules mismatch锛涙崲鐏竟鐣屾仮澶嶄笌鍐崇瓥/闈炲喅绛栬竟鐣屽鐓ф湭浣滀负鏈疆 C5 璺緞楠屾敹銆備笉寰楀啓銆屾。妗堝叏閮ㄩ€氳繃銆嶃€俓n");
++    s.push_str("- 鏈疆 C5 鏈娇鐢ㄩ潪绌?future_inputs锛涜璺緞淇濇寔鎷掔粷銆俓n\n");
++    s.push_str("## 浜ゆ帴娓呭崟涓殑鍘熻〃杩癨n\n");
++    for line in open_issue_lines() {
++        s.push_str("- ");
++        s.push_str(&line);
++        s.push('\n');
++    }
++    s.push_str("\n## F2 鍓嶏紙鏈疆涓嶆墽琛岋級\n\n");
++    s.push_str("- 鍏紑鍏卞悓鍒濇€佸惈鑴戙€佺嫭绔嬬敓鎴愬櫒銆乀_recover銆佺暀 Q 鍏宠緭鍏ャ€佽礋瀵圭収銆丆3/C4 鍙揪鎬э紝鍐嶅喕 L/W/H銆俓n");
++    s.push_str("- 瀛︿範/鍐荤粨鍦ㄦ崲鐏悗棣栨绁炵粡琛屽姩鍓嶅垎鏀紱200 ticks 鍙檺鍒舵寚鏍囩獥鍙ｃ€俓n");
++    s.push_str("- 姝ｅ紡璇勪及绉嶅瓙涓嶅緱鍙備笌鍒濇€?鎸囨爣/瓒呭弬鏁伴€夋嫨銆?01鈥?20 涓嶆槸鏈潵姝ｅ紡璇勪及闆嗐€俓n");
++    fs::write(out.join("open_issues.md"), s).map_err(|e| e.to_string())
++}
++
++fn write_report_md(out: &Path, report: &D2dReport) -> Result<(), String> {
++    let mut md = String::new();
++    md.push_str("# D2-D 鎶ュ憡\n\n");
++    md.push_str(&format!(
++        "婧愮爜 HEAD `{}` git_dirty={} execution_source_differs_from_head={} source_digest=`{}` algo=`{}`\n\n",
++        report.source.git_commit,
++        report.source.git_dirty,
++        report.source.execution_source_differs_from_head,
++        report.source.digest,
++        SOURCE_DIGEST_ALGO
++    ));
++    md.push_str("鏈姤鍛婄敱鏈洰褰曠粨鏋勫寲缁撴灉鐢熸垚銆俙docs/d1/` 涓?`docs/batches/G5.md` 鍘熶欢鏈敼銆傛棦鏈?`docs/d2/` 鐭粨鏋滀繚鐣欐彁浜ゅ墠韬唤锛屼笉鏄妸 commit 鏀规垚褰撳墠 HEAD 鐨勬柊杩愯銆俓n\n");
++    if report.integrity.valid_complete {
++        md.push_str("**鐘舵€侊細40 鏉?C5 璁板綍瀹屾暣涓旀棤宸ョ▼閿欒銆傝繖涓嶆槸瀛︿範闂ㄧ閫氳繃锛屼篃涓嶆槸 F2銆?*\n\n");
++    } else {
++        md.push_str("**鐘舵€侊細鏈壒娆′笉寰楄В璇讳负鏈夋晥瀹屾垚鐨勪富缁熻銆?*\n\n");
++        if !report.integrity.engineering_errors.is_empty() {
++            md.push_str("宸ョ▼閿欒锛歕n");
++            for e in &report.integrity.engineering_errors {
++                md.push_str(&format!("- {e}\n"));
++            }
++            md.push('\n');
++        }
++    }
++    md.push_str("## 鍗忚\n\n");
++    md.push_str(&format!("- 鍛戒护锛歚{}`\n", report.command));
++    md.push_str(&format!("- profile锛歿}\n", report.profile));
++    md.push_str(&format!("- rustc锛歿}\n", report.source.rustc));
++    md.push_str(&format!("- 鑰楁椂锛歿} ms\n", report.elapsed_ms));
++    md.push_str(&format!("- experiment_hash锛歚{}`\n", report.experiment_hash));
++    md.push_str(&format!(
++        "- 瀹為檯 16脳16 RuleSpec锛歚{}`锛圖1 runs.csv 鏇惧啓鍏?128脳128 鍩虹嚎 `{}`锛岃繖鏄叕寮€鐨勮褰曞樊寮傦紝涓嶆槸鏃犺鏄庣殑鍚岄厤缃鐜帮級\n",
++        report.rules_hash, report.base_rules_hash
++    ));
++    md.push_str(&format!(
++        "- 鎹㈢伅鍚?RuleSpec锛歚{}`锛坄apply_lighting`锛屼笌 state.rules_hash 瀵归綈锛塡n",
++        report.rules_hash_after_switch
++    ));
++    md.push_str("- 鍦板浘 16脳16銆佺瀛?101鈥?20銆乴earn/freeze銆?0000 ticks銆乼ick=10000 鎹㈢伅銆佸叧绻佹畺銆乣enable_probe=false`銆俓n");
++    md.push_str("- 涓绘寚鏍囷細鍚庡崐绋嬩唬璋?E 鐨勯€?seed `瀛︿範鈭掑喕缁揱锛沚ootstrap 绉嶅瓙 20260910銆?000 娆★紱閲嶉噰鏍峰崟浣嶆槸瀹屾暣 seed 瀵广€俓n");
++    md.push_str("- 瀛︿範鐜囥€佸鍔便€佺綉缁滄湭鏀广€傛湭寮曞叆 F2 浣庡簱瀛樻垨 L/W銆傛浜℃牱鏈叏閮ㄤ繚鐣欍€俓n\n");
++    md.push_str("## 瀹屾暣鎬n\n");
++    md.push_str(&format!(
++        "- 琛屾暟 {}锛堝簲涓?40锛夛紱閰嶅 {}锛涘喕缁撶粍鏇存柊鍏ㄩ浂 {}锛涙帰閽堝叏鍏?{}锛涘垵鎬佹垚瀵?{}锛涙憳瑕佹湭鍙?{}\n",
++        report.integrity.n_rows,
++        report.integrity.paired_ok,
++        report.integrity.freeze_updates_zero,
++        report.integrity.probe_all_off,
++        report.integrity.initial_pairs_ok,
++        report.integrity.source_digest_unchanged
++    ));
++    let n_res = report.records.len() as i128;
++    if n_res > 0 {
++        let zeros = report
++            .records
++            .iter()
++            .filter(|r| r.p_residual == Some(0))
++            .count();
++        let some = report.records.iter().filter(|r| r.p_residual.is_some()).count();
++        md.push_str(&format!(
++            "- P 浼氳娈嬪樊锛歿some} 鏉″彲璁＄畻锛屽叾涓?{zeros} 鏉′负 0銆傛畫宸畾涔夎 statistics.json銆傞潪闆舵椂涓嶆敼璐︽湰鍑戦浂锛涜瘖鏂?P 涓嶆浛浠?M/U 瀹堟亽銆傚父瑙佹潵婧愬寘鎷閲忎笂闄愩€丯 搴撳瓨鍙樺寲銆佹湭鍒楀叆鍏紡鐨勮€楁暎/淇椤广€佷互鍙婃浜″綋姝ヨ处鎴疯涔夈€俓n\n"
++        ));
++    }
++    md.push_str("## C5 涓绘瘮杈僜n\n");
++    if let (Some(m), Some(l), Some(h)) = (report.mean, report.lo, report.hi) {
++        md.push_str(&format!(
++            "鍚庡崐绋嬩唬璋?E锛堝涔犫垝鍐荤粨锛夐厤瀵瑰潎鍊?{m:.1}锛宐ootstrap 95% [{l:.1}, {h:.1}]銆俓n\n"
++        ));
++        md.push_str(&format!("缁撹锛歿}\n\n", report.conclusion));
++        md.push_str(&format!(
++            "鎹㈢伅瀛樻椿锛氬涔?{} / 鍐荤粨 {}锛涙湡鏈瓨娲伙細瀛︿範 {} / 鍐荤粨 {}锛堝悇 20锛夈€俓n\n",
++            report.pairs.iter().filter(|p| p.learn_alive_switch).count(),
++            report.pairs.iter().filter(|p| p.freeze_alive_switch).count(),
++            report.pairs.iter().filter(|p| p.learn_alive_end).count(),
++            report.pairs.iter().filter(|p| p.freeze_alive_end).count()
++        ));
++    } else {
++        md.push_str(&format!("{}\n\n", report.conclusion));
++    }
++    md.push_str("鍘嗗彶 D1 C5锛坄docs/d1/report.md`锛屼笉鏄湰杞洰鏍囷級锛氬潎鍊?+195084.0 渭E锛?5% [-3581658.0, +4097096.8]銆俓n\n");
++    md.push_str("## 閫?seed 宸€糪n\n");
++    if report.pairs.is_empty() {
++        md.push_str("锛堟棤鏈夋晥閰嶅锛塡n\n");
++    } else {
++        md.push_str("| seed | learn鈭抐reeze 渭E | learn 鎹㈢伅瀛樻椿 | freeze 鎹㈢伅瀛樻椿 |\n|---|---:|---|---|\n");
++        for p in &report.pairs {
++            md.push_str(&format!(
++                "| {} | {:.1} | {} | {} |\n",
++                p.seed, p.diff, p.learn_alive_switch, p.freeze_alive_switch
++            ));
++        }
++        md.push('\n');
++    }
++    md.push_str("## 鏈В鍐抽棶棰榎n\n瑙?`open_issues.md`銆侳2 椤圭洰鏈疆鏈墽琛屻€俓n");
++    fs::write(out.join("report.md"), md).map_err(|e| e.to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use universe_core::probe::RunLedger;
++
++    #[test]
++    fn experiment_hash_stable_and_sensitive() {
++        let spec = reversal_spec();
++        let a = campaign_experiment_hash(&spec);
++        let b = campaign_experiment_hash(&spec);
++        assert_eq!(a, b);
++        let mut other = spec.clone();
++        other.lighting.left_x0 = 4;
++        assert_ne!(campaign_experiment_hash(&spec), campaign_experiment_hash(&other));
++    }
++
++    #[test]
++    fn isolation_accepts_reversal_spec() {
++        let iso = check_isolation(&reversal_spec());
++        assert!(iso.ok, "{:?}", iso.notes);
++        assert_eq!(iso.q_loss_divisor, 16);
++        assert_eq!(iso.substeps, 4);
++        assert_eq!(iso.initial_count, 1);
++        assert_eq!(iso.initial_o_per_cell, 0);
++    }
++
++    #[test]
++    fn p_identity_zero_on_balanced_ledger() {
++        let mut l = RunLedger::default();
++        l.p_initial = Some(1000);
++        l.p_before_death_or_end = Some(1000 + 8 * 10 - 20 - 5 - 3 - 2 - 1);
++        l.photo_extent = 7;
++        l.uptake_o = 3;
++        l.maint_paid = 20;
++        l.cognition = 5;
++        l.thrust_attempt = 3;
++        l.turn_attempt = 2;
++        l.debt_repay = 1;
++        assert_eq!(p_identity_residual(&l), Some(0));
++    }
++
++    #[test]
++    fn pair_by_seed_does_not_use_push_order() {
++        let spec = reversal_spec();
++        let rh = hex_hash(&rules_hash(&spec).unwrap());
++        let eh = hex_hash(&campaign_experiment_hash(&spec));
++        let mk = |seed: u64, freeze: bool, metab: u64| {
++            let sc = c5_scenario(seed, freeze);
++            let st = initialize_reversal_world(&spec, seed).unwrap();
++            C5Record {
++                row: RunRow {
++                    scenario: sc,
++                    ledger: RunLedger {
++                        metab_e_after_switch: metab,
++                        ..RunLedger::default()
++                    },
++                    rules_hash: rh.clone(),
++                    experiment_hash: eh.clone(),
++                    commit: "test".into(),
++                    windows: vec![],
++                    path: vec![],
++                    decisions: vec![],
++                    alive_at_end: false,
++                    final_x: 0.0,
++                    final_y: 0.0,
++                    entered_old: false,
++                    entered_new: false,
++                    c0_pass: None,
++                    error: None,
++                    initial_q: 0,
++                },
++                error_class: None,
++                initial_state_hash: hex_hash(&state_hash(&st).unwrap()),
++                rules_hash_after_switch: None,
++                p_residual: Some(0),
++                probe_enabled: false,
++            }
++        };
++        // Reverse seed order, freeze before learn, to catch order-dependent pairing.
++        let mut recs = Vec::new();
++        for seed in REVERSAL_SEEDS.iter().rev().copied() {
++            recs.push(mk(seed, true, 1));
++            recs.push(mk(seed, false, 4));
++        }
++        let pairs = pair_by_seed(&recs).unwrap();
++        assert_eq!(pairs.len(), 20);
++        assert_eq!(pairs[0].seed, 101);
++        assert_eq!(pairs[0].diff, 3.0);
++        assert_eq!(pairs[19].seed, 120);
++    }
++
++    #[test]
++    fn source_digest_covers_lockfile_not_docs() {
++        let m = execution_source_manifest().unwrap();
++        assert_eq!(m.algorithm, SOURCE_DIGEST_ALGO);
++        assert!(m.files.iter().any(|f| f.path == "Cargo.lock"));
++        assert!(m.files.iter().any(|f| f.path == "rust-toolchain.toml"));
++        assert!(m.files.iter().any(|f| f.path.starts_with("crates/universe_lab/")));
++        assert!(m.files.iter().all(|f| !f.path.starts_with("docs/")));
++        assert!(m.files.iter().all(|f| !f.path.contains("/target/")));
++        let again = execution_source_manifest().unwrap();
++        assert_eq!(m.digest, again.digest);
++    }
++
++    #[test]
++    fn learn_freeze_share_initial_hash() {
++        for seed in [101u64, 120] {
++            assert_eq!(initial_state_hash(seed).unwrap(), initial_state_hash(seed).unwrap());
++        }
++    }
++}
+warning: in the working copy of 'crates/universe_lab/src/bin/d2d.rs', LF will be replaced by CRLF the next time Git touches it
+diff --git a/crates/universe_lab/src/bin/d2d.rs b/crates/universe_lab/src/bin/d2d.rs
+new file mode 100644
+index 0000000..fd9f6de
+--- /dev/null
++++ b/crates/universe_lab/src/bin/d2d.rs
+@@ -0,0 +1,22 @@
++//! Write D2-D C5 artefacts under docs/d2/d2d/<run_id> (or a given directory).
++
++fn main() {
++    let out = std::env::args()
++        .nth(1)
++        .unwrap_or_else(|| "docs/d2/d2d/latest".to_string());
++    match universe_lab::d2d::run_d2d_campaign(&out) {
++        Ok(report) => {
++            eprintln!(
++                "D2-D wrote {out} valid_complete={} rows={}",
++                report.integrity.valid_complete, report.integrity.n_rows
++            );
++            if !report.integrity.valid_complete {
++                std::process::exit(2);
++            }
++        }
++        Err(e) => {
++            eprintln!("D2-D failed: {e}");
++            std::process::exit(1);
++        }
++    }
++}

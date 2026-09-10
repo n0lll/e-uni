@@ -1,0 +1,43 @@
+﻿电子宇宙 D2-D 复审包
+run_id=20260910-c643439
+date_local=2026-09-10
+
+## 源码身份
+HEAD=c64343951a9ceaa96fcad72b8c5c92c1599598a7
+git_dirty=true (untracked review files exist; also uncommitted D2-D runner)
+execution_source_differs_from_head=true
+source_digest_algo=eu-source-digest-v1
+source_digest=a918f24a181612d1f82ef0cb8b5aaee55b4d2228cc4e1064384cefc3d87cb095
+source_digest_unchanged_during_C5=true
+Cannot use git archive HEAD: it would omit uncommitted d2d.rs / bin/d2d.rs / experiment.rs changes.
+
+This pack's source/ directory is the actual execution tree (crates + narrator + Cargo.lock + rust-toolchain.toml).
+It is not a HEAD-only archive.
+
+Uncommitted relative to c643439:
+- crates/universe_lab/src/experiment.rs (execution source digest)
+- crates/universe_lab/src/lib.rs (mod d2d)
+- crates/universe_lab/src/d2d.rs (new)
+- crates/universe_lab/src/bin/d2d.rs (new)
+
+## 入口命令
+cargo test --offline --workspace --exclude observer --exclude narrator
+cargo run --offline -p universe_lab --bin d2 -- docs/d2/d2d/20260910-c643439/short
+cargo run --release --offline -p universe_lab --bin d2d -- docs/d2/d2d/20260910-c643439
+
+## 证据
+evidence/ is docs/d2/d2d/20260910-c643439
+C5: 40 rows, valid_complete=true, mean 57818.0, 95% [-3703555.2, 3958648.4], 尚未观察到可靠收益
+P residuals all 0; freeze learning_update_count all 0; enable_probe=false
+
+## 差分
+diffs/diff-4f237b0-to-actual.patch  D1 commit to actual execution source
+diffs/diff-c643439-to-actual.patch  D2 commit to uncommitted D2-D files
+
+## ZIP
+path=docs/d2/d2d/e-uni-d2d-20260910-c643439.zip
+sha256=8727DFD805C5C071F22DFC64909667F64A4850F0A7100D3354D02C8F4DF5B838
+
+## 排除
+target/, docs/d1 原件未打包为可写副本, 旧独立核验 ZIP, observer 应用
+

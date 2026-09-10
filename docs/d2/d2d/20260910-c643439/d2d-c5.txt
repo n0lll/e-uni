@@ -1,0 +1,52 @@
+   Compiling universe_types v0.1.0 (D:\cursor-project\e-uni\crates\universe_types)
+   Compiling universe_archive v0.1.0 (D:\cursor-project\e-uni\crates\universe_archive)
+   Compiling universe_core v0.1.0 (D:\cursor-project\e-uni\crates\universe_core)
+   Compiling narrator v0.1.0 (D:\cursor-project\e-uni\apps\narrator)
+   Compiling universe_lab v0.1.0 (D:\cursor-project\e-uni\crates\universe_lab)
+    Finished `release` profile [optimized] target(s) in 10.18s
+     Running `target\release\d2d.exe docs/d2/d2d/20260910-c643439`
+D2-D C5-learn seed 101
+D2-D C5-freeze seed 101
+D2-D C5-learn seed 102
+D2-D C5-freeze seed 102
+D2-D C5-learn seed 103
+D2-D C5-freeze seed 103
+D2-D C5-learn seed 104
+D2-D C5-freeze seed 104
+D2-D C5-learn seed 105
+D2-D C5-freeze seed 105
+D2-D C5-learn seed 106
+D2-D C5-freeze seed 106
+D2-D C5-learn seed 107
+D2-D C5-freeze seed 107
+D2-D C5-learn seed 108
+D2-D C5-freeze seed 108
+D2-D C5-learn seed 109
+D2-D C5-freeze seed 109
+D2-D C5-learn seed 110
+D2-D C5-freeze seed 110
+D2-D C5-learn seed 111
+D2-D C5-freeze seed 111
+D2-D C5-learn seed 112
+D2-D C5-freeze seed 112
+D2-D C5-learn seed 113
+D2-D C5-freeze seed 113
+D2-D C5-learn seed 114
+D2-D C5-freeze seed 114
+D2-D C5-learn seed 115
+D2-D C5-freeze seed 115
+D2-D C5-learn seed 116
+D2-D C5-freeze seed 116
+D2-D C5-learn seed 117
+D2-D C5-freeze seed 117
+D2-D C5-learn seed 118
+D2-D C5-freeze seed 118
+D2-D C5-learn seed 119
+D2-D C5-freeze seed 119
+D2-D C5-learn seed 120
+D2-D C5-freeze seed 120
+D2-D wrote docs/d2/d2d/20260910-c643439 valid_complete=true rows=40
+
+EXIT_CODE=0
+ELAPSED_MS=16953
+

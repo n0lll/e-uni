@@ -1,5 +1,7 @@
 # D2 修复报告
 
+> D2-D 收口（修复后完整 C5）见 [`d2d/20260910-c643439/report.md`](d2d/20260910-c643439/report.md)。本文件仍是 D2 提交前短对照，身份保持 `4f237b0` dirty，没有改成新提交号。
+
 源码提交 `4f237b0e4adddf3df42ebf782b4367e9ac2ef3ab` dirty=true source_digest=`ec9d8b166366e0b159ed4cd023e69d745beac6e9949ba49f5909473329708df3`
 
 本报告由 `docs/d2/` 结构化结果生成。`docs/d1/` 与 `docs/batches/G5.md` 保持原件。
