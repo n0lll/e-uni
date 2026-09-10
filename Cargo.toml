@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/universe_types",
+    "crates/universe_core",
+    "crates/universe_archive",
+    "crates/universe_lab",
+    "apps/observer",
+    "apps/narrator",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+publish = false
+rust-version = "1.92"
+
+[workspace.dependencies]
+universe_types = { path = "crates/universe_types" }
+universe_core = { path = "crates/universe_core" }
+universe_archive = { path = "crates/universe_archive" }
+universe_lab = { path = "crates/universe_lab" }
+sha2 = "0.10.9"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9.34"
+thiserror = "2.0.17"
+libm = "0.2.15"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+hex = "0.4.3"

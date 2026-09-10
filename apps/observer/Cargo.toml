@@ -1,0 +1,12 @@
+[package]
+name = "observer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+universe_types = { workspace = true }
+universe_core = { workspace = true }
+universe_archive = { workspace = true }

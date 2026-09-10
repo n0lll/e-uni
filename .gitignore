@@ -1,0 +1,6 @@
+/target
+**/*.pdb
+.DS_Store
+*.swp
+/apps/observer/dist
+/apps/narrator/dist

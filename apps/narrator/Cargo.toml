@@ -1,0 +1,22 @@
+[package]
+name = "narrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "narrator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "narrator"
+path = "src/main.rs"
+
+[dependencies]
+universe_types = { workspace = true }
+universe_archive = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
