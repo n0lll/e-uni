@@ -10,13 +10,15 @@ use crate::physiology::{
     deposit_death, is_irrecoverable, maintenance_cost, pay_maintenance_parts, scale_control_parts,
 };
 use crate::probe::{
-    budget_p, ControlMode, DecisionDiag, FaultPoint, RunLedger, TickProbe,
+    budget_p, ControlMode, DecisionDiag, DecisionSkip, FaultPoint, ObservationFrame, RunLedger,
+    TickProbe,
 };
 use crate::react::{phase_p5b_uptake, phase_p5c_photo, phase_p5d_metab};
 use crate::repro::{phase_births, phase_build_embryos, phase_start_embryos};
-use crate::sense::sense;
+use crate::sense::sense_observation;
 use universe_types::{
-    LifeEvent, LifeEventKind, NumericFault, Organism, SimError, WorldState, RuleSpec, INPUTS,
+    rules_hash, Accounts, LifeEvent, LifeEventKind, LightingRules, NumericFault, Organism, SimError,
+    WorldState, RuleSpec, INPUTS,
 };
 
 #[derive(Clone, Debug)]
@@ -37,6 +39,8 @@ pub struct World {
     pub last_probe: TickProbe,
     pub run_ledger: RunLedger,
     pub last_decisions: Vec<DecisionDiag>,
+    pub last_skips: Vec<DecisionSkip>,
+    pub last_observation: std::collections::HashMap<u64, ObservationFrame>,
     last_obs: std::collections::HashMap<u64, [f64; INPUTS]>,
 }
 
@@ -57,8 +61,30 @@ impl World {
             last_probe: TickProbe::default(),
             run_ledger: RunLedger::default(),
             last_decisions: Vec::new(),
+            last_skips: Vec::new(),
+            last_observation: std::collections::HashMap::new(),
             last_obs: std::collections::HashMap::new(),
         }
+    }
+
+    pub fn apply_runtime(
+        &mut self,
+        freeze_learning: bool,
+        disable_active_motion: bool,
+        disable_reproduction: bool,
+        control_mode: ControlMode,
+    ) {
+        self.freeze_learning = freeze_learning;
+        self.disable_active_motion = disable_active_motion;
+        self.disable_reproduction = disable_reproduction;
+        self.control_mode = control_mode;
+    }
+
+    /// Versioned lighting change: executing RuleSpec and state's rules_hash stay aligned.
+    pub fn apply_lighting(&mut self, lighting: LightingRules) -> Result<(), SimError> {
+        self.spec.lighting = lighting;
+        self.state.rules_hash = rules_hash(&self.spec)?;
+        Ok(())
     }
 
     pub fn step(&mut self) -> Result<(), SimError> {
@@ -78,6 +104,8 @@ impl World {
         let ledger = self.run_ledger.clone();
         let probe = self.last_probe.clone();
         let decisions = self.last_decisions.clone();
+        let skips = self.last_skips.clone();
+        let frames = self.last_observation.clone();
         let obs = self.last_obs.clone();
         let metab_diss = self.last_metab_diss;
         let metab_e = self.last_metab_e_new;
@@ -89,6 +117,8 @@ impl World {
                 self.run_ledger = ledger;
                 self.last_probe = probe;
                 self.last_decisions = decisions;
+                self.last_skips = skips;
+                self.last_observation = frames;
                 self.last_obs = obs;
                 self.last_metab_diss = metab_diss;
                 self.last_metab_e_new = metab_e;
@@ -138,7 +168,20 @@ impl World {
             }
         }
 
-        // P0: future inputs (none unless queued).
+        // P0: unsupported future_inputs are rejected; observation uses this boundary.
+        if !self.state.future_inputs.is_empty() {
+            return Err(SimError::ExperimentSetup(
+                "non-empty future_inputs are not executed and must not be silently ignored".into(),
+            ));
+        }
+        let p0_accounts: std::collections::HashMap<u64, Accounts> = self
+            .state
+            .organisms
+            .iter()
+            .filter(|o| !o.marked_dead)
+            .map(|o| (o.entity_id, o.accounts))
+            .collect();
+
         // P1: maintenance.
         let present: Vec<u64> = self
             .state
@@ -147,8 +190,71 @@ impl World {
             .filter(|o| !o.marked_dead)
             .map(|o| o.entity_id)
             .collect();
+        let decision = self.state.tick % self.spec.time.decision_every_ticks == 0;
+        let cog = self.spec.cognition_cost_b();
+        let n_org = self.state.organisms.len();
+        let mut will_decide = vec![false; n_org];
+        if decision {
+            self.last_observation.clear();
+            self.last_skips.clear();
+            for i in 0..n_org {
+                if self.state.organisms[i].marked_dead {
+                    continue;
+                }
+                let id = self.state.organisms[i].entity_id;
+                let has_emb = self.state.embryos.iter().any(|e| e.parent_id == id);
+                if cognition_eligible(&self.state.organisms[i], &self.spec, has_emb) {
+                    will_decide[i] = true;
+                    {
+                        let org = &mut self.state.organisms[i];
+                        org.last_feedback = org.feedback;
+                        org.feedback = universe_types::IntervalFeedback::default();
+                    }
+                    let org = &self.state.organisms[i];
+                    let tick = self.state.tick;
+                    let fb_ticks = org.last_feedback.ticks;
+                    let start = tick.saturating_sub(fb_ticks);
+                    let obs = sense_observation(
+                        &self.state,
+                        &self.spec,
+                        org,
+                        p0_accounts[&id],
+                        org.last_feedback,
+                    );
+                    self.last_observation.insert(
+                        id,
+                        ObservationFrame {
+                            entity_id: id,
+                            observation_state_tick: tick,
+                            feedback_start_tick: start,
+                            feedback_end_tick: tick,
+                            feedback_ticks: fb_ticks,
+                            obs,
+                            p0_e_old: p0_accounts[&id].e_old,
+                            p0_c: p0_accounts[&id].c,
+                        },
+                    );
+                } else {
+                    let org = &self.state.organisms[i];
+                    let reason = if org.accounts.e_old < maintenance_cost(org, &self.spec, has_emb)
+                    {
+                        "maintenance_unpaid"
+                    } else {
+                        "no_cognition_energy"
+                    };
+                    self.last_skips.push(DecisionSkip {
+                        tick: self.state.tick,
+                        entity_id: id,
+                        reason: reason.into(),
+                        e_old: org.accounts.e_old,
+                        open_feedback_ticks: org.feedback.ticks,
+                    });
+                }
+            }
+        }
+
         let mut maint_diss = 0u64;
-        let mut maint_ok = vec![false; self.state.organisms.len()];
+        let mut maint_ok = vec![false; n_org];
         for i in 0..self.state.organisms.len() {
             if self.state.organisms[i].marked_dead {
                 continue;
@@ -179,15 +285,12 @@ impl World {
         }
         self.add_diss(maint_diss)?;
 
-        // Cognition fee on decision ticks.
-        let decision = self.state.tick % self.spec.time.decision_every_ticks == 0;
-        let cog = self.spec.cognition_cost_b();
         if decision {
             for (i, org) in self.state.organisms.iter_mut().enumerate() {
                 if org.marked_dead {
                     continue;
                 }
-                if maint_ok[i] && org.accounts.e_old >= cog {
+                if will_decide[i] && org.accounts.e_old >= cog {
                     org.accounts.e_old -= cog;
                     self.state.audit.step_dissipation = self
                         .state
@@ -226,43 +329,59 @@ impl World {
                         .find(|g| g.hash == gh)
                         .cloned();
                     if let Some(g) = g {
-                        let obs = sense(&self.state, &self.spec, &self.state.organisms[i]);
-                        let org = &self.state.organisms[i];
-                        let allow_repro = org.age >= self.spec.evolution.min_age
-                            && org.accounts.b * self.spec.evolution.min_b_over_target_denom
-                                >= self.spec.evolution.min_b_over_target_numer * org.b_target
-                            && org.maintenance_debt == 0
-                            && !self
-                                .state
-                                .embryos
-                                .iter()
-                                .any(|e| e.parent_id == org.entity_id)
-                            && !self.disable_reproduction;
+                        let id = self.state.organisms[i].entity_id;
+                        let frame = self
+                            .last_observation
+                            .get(&id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                SimError::ExperimentSetup("missing ObservationFrame for paid cognition".into())
+                            })?;
                         let seed = self.state.root_seed;
                         let tick = self.state.tick;
                         let freeze = self.freeze_learning;
+                        let allow_repro = {
+                            let org = &self.state.organisms[i];
+                            org.age >= self.spec.evolution.min_age
+                                && org.accounts.b * self.spec.evolution.min_b_over_target_denom
+                                    >= self.spec.evolution.min_b_over_target_numer * org.b_target
+                                && org.maintenance_debt == 0
+                                && !self
+                                    .state
+                                    .embryos
+                                    .iter()
+                                    .any(|e| e.parent_id == org.entity_id)
+                                && !self.disable_reproduction
+                        };
                         let mut diag = decide(
                             &self.spec,
                             &mut self.state.organisms[i],
                             &g,
-                            &obs,
+                            &frame.obs,
                             seed,
                             tick,
                             freeze,
                             allow_repro,
                         )?;
+                        diag.observation_state_tick = frame.observation_state_tick;
+                        diag.feedback_start_tick = frame.feedback_start_tick;
+                        diag.feedback_end_tick = frame.feedback_end_tick;
+                        diag.feedback_ticks = frame.feedback_ticks;
+                        diag.obs = frame.obs;
+                        diag.actual_forward_displacement =
+                            self.state.organisms[i].last_feedback.thrust_sum;
+                        diag.actual_unwrapped_turn = self.state.organisms[i].last_feedback.turn_sum;
                         if diag.applied_update {
                             self.run_ledger.learning_update_count =
                                 self.run_ledger.learning_update_count.saturating_add(1);
                         }
                         if self.enable_probe {
-                            let id = self.state.organisms[i].entity_id;
                             diag.input_change = if let Some(prev) = self.last_obs.get(&id) {
-                                l2_delta(prev, &obs)
+                                l2_delta(prev, &frame.obs)
                             } else {
                                 0.0
                             };
-                            self.last_obs.insert(id, obs);
+                            self.last_obs.insert(id, frame.obs);
                             self.last_decisions.push(diag);
                         }
                     }
@@ -295,6 +414,7 @@ impl World {
 
         // P3: pay motion attempt.
         let mut motion_diss = 0u64;
+        let mut paid_rows: Vec<(u64, i8, i8, f64, f64, u64)> = Vec::new();
         for org in &mut self.state.organisms {
             if org.marked_dead {
                 continue;
@@ -311,33 +431,39 @@ impl World {
             motion_diss = motion_diss
                 .checked_add(pay.total())
                 .ok_or(NumericFault::Overflow("motion_sum"))?;
+            paid_rows.push((
+                org.entity_id,
+                org.control.thrust,
+                org.control.turn,
+                org.control.u_effective,
+                org.control.w_effective,
+                pay.total(),
+            ));
         }
         self.add_diss(motion_diss)?;
-        if let Some(last) = self.last_decisions.last_mut() {
-            if let Some(org) = self
-                .state
-                .organisms
-                .iter()
-                .find(|o| o.entity_id == last.entity_id)
+        let tick_now = self.state.tick;
+        for (eid, pu, pw, ue, we, energy) in paid_rows {
+            if let Some(last) = self
+                .last_decisions
+                .iter_mut()
+                .rev()
+                .find(|d| d.tick == tick_now && d.entity_id == eid)
             {
-                last.paid_thrust = org.control.thrust;
-                last.paid_turn = org.control.turn;
+                last.paid_thrust = pu;
+                last.paid_turn = pw;
+                last.u_effective = ue;
+                last.w_effective = we;
+                last.paid_motion_energy = energy;
             }
         }
 
         // P4
         physics_substeps(&mut self.state, &self.spec)?;
-        let dt = 0.025;
-        let nsub = self.spec.physics.substeps as f64;
         for org in &self.state.organisms {
             if org.marked_dead {
                 continue;
             }
-            let dth = nsub
-                * org.control.w_effective.abs()
-                * self.spec.physics.max_angular_speed
-                * dt;
-            let scaled = (dth * 1e9).round().max(0.0) as u64;
+            let scaled = (org.last_dtheta.abs() * 1e9).round().max(0.0) as u64;
             probe.abs_dtheta = probe.abs_dtheta.saturating_add(scaled);
         }
         self.maybe_fault(FaultPoint::AfterP4)?;
@@ -416,13 +542,9 @@ impl World {
             // Reward dying bodies before wiping accounts (ch. 37.4).
             let r = tick_reward(&self.state.organisms[i], &self.spec, 0, true);
             accumulate_interval(&mut self.state.organisms[i].brain, r, &self.spec);
-            let u_eff = self.state.organisms[i].control.u_effective;
-            let w_eff = self.state.organisms[i].control.w_effective;
             {
                 let fb = &mut self.state.organisms[i].feedback;
                 fb.ticks += 1;
-                fb.thrust_sum += u_eff;
-                fb.turn_sum += w_eff;
                 fb.died = true;
             }
             let d = deposit_death(&mut self.state, &self.spec, i)?;
@@ -457,12 +579,8 @@ impl World {
             let births = births_this.get(&id).copied().unwrap_or(0);
             let r = tick_reward(&self.state.organisms[i], &self.spec, births, false);
             accumulate_interval(&mut self.state.organisms[i].brain, r, &self.spec);
-            let u_eff = self.state.organisms[i].control.u_effective;
-            let w_eff = self.state.organisms[i].control.w_effective;
             let fb = &mut self.state.organisms[i].feedback;
             fb.ticks += 1;
-            fb.thrust_sum += u_eff;
-            fb.turn_sum += w_eff;
         }
         self.state.organisms.retain(|o| !o.marked_dead);
         gc_unreferenced_genomes(&mut self.state);
@@ -580,10 +698,14 @@ impl World {
                     {
                         continue;
                     }
-                    let obs = sense(&self.state, &self.spec, &self.state.organisms[i]);
+                    let id = self.state.organisms[i].entity_id;
+                    let frame = match self.last_observation.get(&id) {
+                        Some(f) => f.clone(),
+                        None => continue,
+                    };
                     let org = &mut self.state.organisms[i];
                     zero_control(org);
-                    reflex_q(org, &self.spec, &obs);
+                    reflex_q(org, &self.spec, &frame);
                 }
             }
         }
@@ -707,7 +829,8 @@ fn oracle_goto(org: &mut Organism, target: (f64, f64)) {
     }
 }
 
-fn reflex_q(org: &mut Organism, spec: &RuleSpec, obs: &[f64; INPUTS]) {
+fn reflex_q(org: &mut Organism, spec: &RuleSpec, frame: &ObservationFrame) {
+    let obs = &frame.obs;
     let ticks = org.last_feedback.ticks.max(1);
     let photo_per = org.last_feedback.photo_extent as f64 / ticks as f64;
     let p_in = photo_per * 8.0;
@@ -746,6 +869,20 @@ fn reflex_q(org: &mut Organism, spec: &RuleSpec, obs: &[f64; INPUTS]) {
             org.control.turn = -1;
         }
     }
+}
+
+fn cognition_eligible(org: &Organism, spec: &RuleSpec, has_emb: bool) -> bool {
+    let cost = maintenance_cost(org, spec, has_emb);
+    if org.accounts.e_old < cost {
+        return false;
+    }
+    let mut e = org.accounts.e_old - cost;
+    let debt = org.maintenance_debt;
+    if debt > 0 && e > 0 {
+        let repay = e.min(spec.physiology.debt_repay_per_tick).min(debt);
+        e -= repay;
+    }
+    e >= spec.cognition_cost_b()
 }
 
 fn gc_unreferenced_genomes(state: &mut WorldState) {

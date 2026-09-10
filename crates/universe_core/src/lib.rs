@@ -18,13 +18,17 @@ pub mod world;
 
 pub use audit::{compute_mu, energy_identity_holds, MuTotals};
 pub use fields::{decay_s_q, phase_p5a, transport_all_fields, transport_deltas};
-pub use init::{initialize_reversal_world, initialize_world, lighting_cells, lighting_centroid};
+pub use init::{
+    initialize_reversal_world, initialize_world, lighting_cells, lighting_centroid,
+    retarget_audit_baseline,
+};
 pub use physiology::{
     attempt_motion_cost, is_irrecoverable, maintenance_cost, pay_maintenance, pay_maintenance_parts,
     scale_control, scale_control_parts, MaintPay, MotionPay,
 };
 pub use probe::{
-    budget_p, ControlMode, DecisionDiag, FaultPoint, RunLedger, TickProbe,
+    aggregate_decisions, budget_p, ControlMode, DecisionAggregate, DecisionDiag, DecisionSkip,
+    FaultPoint, ObservationFrame, RunLedger, TickProbe,
 };
 pub use ledger::{
     catabolism, commit_e_new_into_old, n_uptake, o_uptake, photosynth, repair, spend_old_energy,
@@ -675,3 +679,5 @@ mod g4_tests {
 
 #[cfg(test)]
 mod d1_tests;
+#[cfg(test)]
+mod d2_tests;

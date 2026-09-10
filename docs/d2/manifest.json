@@ -1,0 +1,10 @@
+{
+  "campaign": "D2",
+  "commit": "4f237b0e4adddf3df42ebf782b4367e9ac2ef3ab",
+  "dirty": true,
+  "source_digest": "ec9d8b166366e0b159ed4cd023e69d745beac6e9949ba49f5909473329708df3",
+  "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+  "base_rules_hash": "6e27f665f00d508e8a49b0a9fb6409163fa4c7970ec3d58755f13b90ae180a9b",
+  "status": "cases_recorded",
+  "note": "docs/d1 and docs/batches/G5.md are historical; this directory is D2 only."
+}

@@ -153,3 +153,11 @@ pub fn initialize_reversal_world(spec: &RuleSpec, root_seed: u64) -> Result<Worl
     state.sort_authoritative();
     Ok(state)
 }
+
+/// Recompute M0/U0 after a public experimental initial-state edit.
+pub fn retarget_audit_baseline(state: &mut WorldState, spec: &RuleSpec) -> Result<(), NumericFault> {
+    let mu = compute_mu(state, spec.reactions.chem_e_per_organic)?;
+    state.audit.initial_m = mu.m;
+    state.audit.initial_u = mu.u;
+    Ok(())
+}

@@ -426,8 +426,6 @@ pub fn decide(
     org.control.metab_boost = hs.binary[3];
     org.control.repair = hs.binary[4];
     org.control.reproduce = hs.binary[5] && allow_repro;
-    org.last_feedback = org.feedback;
-    org.feedback = universe_types::IntervalFeedback::default();
     org.brain.has_pending = true;
     reset_interval(&mut org.brain);
 
@@ -452,6 +450,10 @@ pub fn decide(
             a_minus_a0 += aa * aa;
             trace_a += org.brain.e_a[i][j] * org.brain.e_a[i][j];
         }
+    }
+    let mut v_norm = 0.0;
+    for j in 0..PHI {
+        v_norm += org.brain.v[j] * org.brain.v[j];
     }
     let mut entropy = entropy_cat(hs.p_thr) + entropy_cat(hs.p_turn);
     for h in 0..10 {
@@ -478,10 +480,19 @@ pub fn decide(
         da_feat_abs: da_feat,
         v_prev: stats.v_prev,
         v_next: stats.v_next,
+        v_norm: libm::sqrt(v_norm),
         intent_thrust: hs.thrust,
         intent_turn: hs.turn,
+        binary_intent: hs.binary,
+        p_thr: hs.p_thr,
+        p_turn: hs.p_turn,
+        p_bin: hs.p_bin,
         paid_thrust: org.control.thrust,
         paid_turn: org.control.turn,
+        h_before,
+        h_after: h_next,
+        phi: phi_next,
+        ..crate::probe::DecisionDiag::default()
     })
 }
 

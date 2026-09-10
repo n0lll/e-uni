@@ -3,6 +3,18 @@
 use crate::rng::{geometry_draw_index, random_u32};
 use universe_types::{NumericFault, RuleSpec, WorldState, RngDomain};
 
+/// Duration of one physical tick, seconds.
+pub fn tick_dt(spec: &RuleSpec) -> f64 {
+    let den = spec.time.dt_denominator.max(1);
+    spec.time.dt_numerator as f64 / den as f64
+}
+
+/// Duration of one physics substep, seconds.
+pub fn substep_dt(spec: &RuleSpec) -> f64 {
+    let nsub = spec.physics.substeps.max(1);
+    tick_dt(spec) / f64::from(nsub)
+}
+
 pub fn wrap_angle(mut theta: f64) -> f64 {
     let pi = std::f64::consts::PI;
     let two_pi = 2.0 * pi;
@@ -54,7 +66,7 @@ pub fn integrate_substep(
     w_eff: f64,
     spec: &RuleSpec,
 ) -> (f64, f64, f64) {
-    let dt = 0.025;
+    let dt = substep_dt(spec);
     let omega = w_eff * spec.physics.max_angular_speed;
     let v = u_eff * spec.physics.max_linear_speed;
     let theta2 = wrap_angle(theta + omega * dt);
@@ -235,29 +247,42 @@ pub fn solve_contacts(
 
 pub fn physics_substeps(state: &mut WorldState, spec: &RuleSpec) -> Result<(), NumericFault> {
     let nsub = spec.physics.substeps;
+    let dt = substep_dt(spec);
     for s in 0..nsub {
+        let mut starts = Vec::with_capacity(state.organisms.len());
         for org in &mut state.organisms {
+            if org.marked_dead {
+                starts.push(None);
+                continue;
+            }
+            let x0 = org.geom.x;
+            let y0 = org.geom.y;
+            let omega = org.control.w_effective * spec.physics.max_angular_speed;
+            let v = org.control.u_effective * spec.physics.max_linear_speed;
+            let dtheta = omega * dt;
+            let th2 = wrap_angle(org.geom.theta + dtheta);
+            org.geom.x = x0 + v * dt * libm::cos(th2);
+            org.geom.y = y0 + v * dt * libm::sin(th2);
+            org.geom.theta = th2;
+            starts.push(Some((x0, y0, dtheta, th2)));
+        }
+        solve_contacts(state, spec, s)?;
+        for (org, start) in state.organisms.iter_mut().zip(starts.into_iter()) {
+            org.geom.theta = wrap_angle(org.geom.theta);
+            let Some((x0, y0, dtheta, heading)) = start else {
+                continue;
+            };
             if org.marked_dead {
                 continue;
             }
-            let (x, y, th) = integrate_substep(
-                org.geom.x,
-                org.geom.y,
-                org.geom.theta,
-                org.control.u_effective,
-                org.control.w_effective,
-                spec,
-            );
-            org.last_dx += x - org.geom.x;
-            org.last_dy += y - org.geom.y;
-            org.last_dtheta += th - org.geom.theta;
-            org.geom.x = x;
-            org.geom.y = y;
-            org.geom.theta = th;
-        }
-        solve_contacts(state, spec, s)?;
-        for org in &mut state.organisms {
-            org.geom.theta = wrap_angle(org.geom.theta);
+            let dx = org.geom.x - x0;
+            let dy = org.geom.y - y0;
+            let forward = dx * libm::cos(heading) + dy * libm::sin(heading);
+            org.last_dx += dx;
+            org.last_dy += dy;
+            org.last_dtheta += dtheta;
+            org.feedback.thrust_sum += forward;
+            org.feedback.turn_sum += dtheta;
         }
     }
     Ok(())

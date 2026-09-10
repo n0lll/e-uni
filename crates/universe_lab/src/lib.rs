@@ -7,6 +7,8 @@ use universe_core::world::World;
 use universe_types::{BrainState, RuleSpec, PHI, POLICY_LOGITS};
 
 pub mod d1;
+pub mod d2;
+pub mod experiment;
 
 /// Chapter 42.4 readout reversal, one seed.
 /// Returns last-5k correct-direction fraction and mean last-step fixture reward.

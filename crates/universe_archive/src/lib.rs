@@ -32,6 +32,8 @@ pub struct Archive {
     last_batch_tick: u64,
     /// Test hook: fail after tmp write, before rename/SQLite register.
     pub fail_before_rename: bool,
+    /// Test hook: fail after inserting this many events in `record_committed`.
+    pub fail_event_after: Option<usize>,
 }
 
 impl Archive {
@@ -56,12 +58,13 @@ impl Archive {
                 content_hash BLOB NOT NULL
             );
             CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tick INTEGER NOT NULL,
+                local_index INTEGER NOT NULL,
                 kind INTEGER NOT NULL,
                 a INTEGER NOT NULL,
                 b INTEGER NOT NULL,
-                amount INTEGER NOT NULL
+                amount INTEGER NOT NULL,
+                PRIMARY KEY (tick, local_index)
             );
             CREATE TABLE IF NOT EXISTS hashes (
                 tick INTEGER PRIMARY KEY,
@@ -80,11 +83,29 @@ impl Archive {
         )
         .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
         let rules = spec.encode_canonical().map_err(SimError::from)?;
-        db.execute(
-            "INSERT OR REPLACE INTO meta(k,v) VALUES ('rules_canonical', ?1)",
-            params![rules],
-        )
-        .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+        let existing: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT v FROM meta WHERE k='rules_canonical'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+        match existing {
+            Some(old) if old != rules => {
+                return Err(SimError::ArchiveFailure(
+                    "archive rules_canonical does not match opened RuleSpec".into(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                db.execute(
+                    "INSERT INTO meta(k,v) VALUES ('rules_canonical', ?1)",
+                    params![rules],
+                )
+                .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+            }
+        }
         Ok(Self {
             dir,
             db,
@@ -94,6 +115,7 @@ impl Archive {
             snap_every: spec.archive.checkpoint_every_ticks.max(1),
             last_batch_tick: 0,
             fail_before_rename: false,
+            fail_event_after: None,
         })
     }
 
@@ -156,19 +178,52 @@ impl Archive {
         events: &[LifeEvent],
     ) -> Result<(), SimError> {
         let live = state.tick;
-        self.set_u64("live_tick", live)?;
-        for e in events {
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(k,v) VALUES ('live_tick', ?1)",
+            params![live.to_le_bytes().as_slice()],
+        )
+        .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+        for (i, e) in events.iter().enumerate() {
+            if let Some(limit) = self.fail_event_after {
+                if i >= limit {
+                    return Err(SimError::ArchiveFailure("injected event insert failure".into()));
+                }
+            }
             let row_bytes = 40u64;
             if self.pending_bytes.saturating_add(row_bytes) > self.max_unwritten {
                 return Err(SimError::SafetyPause(
                     "unwritten archive buffer exceeds 256 MiB".into(),
                 ));
             }
-            self.db
-                .execute(
-                    "INSERT INTO events(tick,kind,a,b,amount) VALUES (?1,?2,?3,?4,?5)",
+            let existing: Option<(i64, i64, i64, i64, i64)> = tx
+                .query_row(
+                    "SELECT tick, kind, a, b, amount FROM events WHERE tick=?1 AND local_index=?2",
+                    params![e.tick as i64, i as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()
+                .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+            if let Some((tick, kind, a, b, amount)) = existing {
+                if tick != e.tick as i64
+                    || kind != e.kind.code() as i64
+                    || a != e.entity_a as i64
+                    || b != e.entity_b as i64
+                    || amount != e.amount as i64
+                {
+                    return Err(SimError::ArchiveFailure(
+                        "idempotent event replay mismatch".into(),
+                    ));
+                }
+            } else {
+                tx.execute(
+                    "INSERT INTO events(tick,local_index,kind,a,b,amount) VALUES (?1,?2,?3,?4,?5,?6)",
                     params![
                         e.tick as i64,
+                        i as i64,
                         e.kind.code() as i64,
                         e.entity_a as i64,
                         e.entity_b as i64,
@@ -176,10 +231,13 @@ impl Archive {
                     ],
                 )
                 .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+            }
             self.pending_bytes += row_bytes;
         }
+        tx.commit()
+            .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
         if live > 0 && live % self.hash_every == 0 {
-            self.close_batch(state, events.len())?;
+            self.close_batch(state)?;
         }
         if live > 0 && live % self.snap_every == 0 {
             self.write_snapshot(state)?;
@@ -187,14 +245,32 @@ impl Archive {
         Ok(())
     }
 
+    /// Write and register S0 or any committed boundary, including tick 0.
+    pub fn checkpoint_boundary(&mut self, state: &WorldState) -> Result<(), SimError> {
+        self.write_snapshot(state)
+    }
+
+    pub fn record_initial(&mut self, state: &WorldState) -> Result<(), SimError> {
+        self.checkpoint_boundary(state)?;
+        self.set_u64("live_tick", state.tick)
+    }
+
     pub fn flush_exit(&mut self, state: &WorldState) -> Result<(), SimError> {
-        self.close_batch(state, 0)?;
+        self.close_batch(state)?;
         Ok(())
     }
 
-    fn close_batch(&mut self, state: &WorldState, extra_events: usize) -> Result<(), SimError> {
+    fn close_batch(&mut self, state: &WorldState) -> Result<(), SimError> {
         let h = state_hash(state).map_err(SimError::from)?;
         let tick = state.tick;
+        let event_count: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE tick >= ?1 AND tick < ?2",
+                params![self.last_batch_tick as i64, tick as i64],
+                |r| r.get(0),
+            )
+            .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
         let tx = self
             .db
             .unchecked_transaction()
@@ -206,7 +282,7 @@ impl Archive {
         .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
         tx.execute(
             "INSERT OR REPLACE INTO batches(end_tick, state_hash, event_count) VALUES (?1,?2,?3)",
-            params![tick as i64, h.as_slice(), extra_events as i64],
+            params![tick as i64, h.as_slice(), event_count],
         )
         .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
         tx.execute(
@@ -340,7 +416,7 @@ impl Archive {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT tick, kind, a, b, amount FROM events WHERE tick >= ?1 AND tick < ?2 ORDER BY id",
+                "SELECT tick, kind, a, b, amount FROM events WHERE tick >= ?1 AND tick < ?2 ORDER BY tick, local_index",
             )
             .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
         let rows = stmt
@@ -510,6 +586,105 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s0_restores_before_periodic_snapshot() {
+        let spec = RuleSpec::eu_core_1();
+        let dir = std::env::temp_dir().join(format!(
+            "eu-arch-s0-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut arch = Archive::open(&dir, &spec).unwrap();
+        let st = WorldState::empty(&spec, 7).unwrap();
+        arch.record_initial(&st).unwrap();
+        let found = arch.latest_snapshot_tick(3).unwrap().expect("S0");
+        assert_eq!(found.0, 0);
+        let loaded = Archive::load_snapshot_file(&found.1, Some(found.2)).unwrap();
+        assert_eq!(state_hash(&st).unwrap(), state_hash(&loaded).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn event_retry_is_idempotent() {
+        let spec = RuleSpec::eu_core_1();
+        let dir = std::env::temp_dir().join(format!(
+            "eu-arch-evt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut arch = Archive::open(&dir, &spec).unwrap();
+        let mut st = WorldState::empty(&spec, 1).unwrap();
+        st.tick = 1;
+        let events = [
+            LifeEvent {
+                tick: 0,
+                kind: LifeEventKind::Death,
+                entity_a: 1,
+                entity_b: 0,
+                amount: 3,
+            },
+            LifeEvent {
+                tick: 0,
+                kind: LifeEventKind::EmbryoCancel,
+                entity_a: 1,
+                entity_b: 0,
+                amount: 4,
+            },
+        ];
+        arch.fail_event_after = Some(1);
+        let err = arch.record_committed(&st, &events).unwrap_err();
+        match err {
+            SimError::ArchiveFailure(msg) => assert!(msg.contains("event insert")),
+            other => panic!("{other:?}"),
+        }
+        let n0: i64 = arch
+            .db
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n0, 0);
+        arch.fail_event_after = None;
+        arch.record_committed(&st, &events).unwrap();
+        arch.record_committed(&st, &events).unwrap();
+        let n: i64 = arch
+            .db
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_rejects_rules_mismatch() {
+        let spec = RuleSpec::eu_core_1();
+        let dir = std::env::temp_dir().join(format!(
+            "eu-arch-rules-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _arch = Archive::open(&dir, &spec).unwrap();
+        drop(_arch);
+        let mut spec2 = spec.clone();
+        spec2.lighting.radiation_input_per_cell = spec.lighting.radiation_input_per_cell + 1;
+        let err = match Archive::open(&dir, &spec2) {
+            Ok(_) => panic!("expected rules mismatch"),
+            Err(e) => e,
+        };
+        match err {
+            SimError::ArchiveFailure(msg) => assert!(msg.contains("rules_canonical")),
+            other => panic!("{other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

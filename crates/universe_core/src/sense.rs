@@ -1,7 +1,7 @@
 //! Sense 64-vector: 32 values + 32 validity flags (ch. 36.1).
 
-use crate::physics::cell_xy;
-use universe_types::{Organism, RuleSpec, WorldState, INPUTS};
+use crate::physics::{cell_xy, tick_dt};
+use universe_types::{Accounts, IntervalFeedback, Organism, RuleSpec, WorldState, INPUTS};
 
 const DIRS: [f64; 4] = [0.0, std::f64::consts::FRAC_PI_2, std::f64::consts::PI, -std::f64::consts::FRAC_PI_2];
 const RANGES: [f64; 3] = [1.0, 2.0, 4.0];
@@ -170,9 +170,19 @@ pub fn sense(state: &WorldState, spec: &RuleSpec, org: &Organism) -> [f64; INPUT
     } else {
         o[26] = sat01(fb.struct_loss as f64 / org.b_target as f64);
         o[27] = sat11(fb.e_net_i128 as f64 / org.e_max as f64);
-        let inv = fb.ticks as f64;
-        o[28] = sat11((fb.thrust_sum / inv) / spec.physics.max_linear_speed);
-        o[29] = sat11((fb.turn_sum / inv) / spec.physics.max_angular_speed);
+        let duration = tick_dt(spec) * fb.ticks as f64;
+        let vmax = spec.physics.max_linear_speed;
+        let wmax = spec.physics.max_angular_speed;
+        if duration > 0.0 && vmax > 0.0 {
+            o[28] = sat11((fb.thrust_sum / duration) / vmax);
+        } else {
+            o[28] = 0.0;
+        }
+        if duration > 0.0 && wmax > 0.0 {
+            o[29] = sat11((fb.turn_sum / duration) / wmax);
+        } else {
+            o[29] = 0.0;
+        }
         let max_up = spec.rates.n_uptake_base.saturating_add(spec.rates.n_uptake_boost)
             + spec.rates.o_uptake_when_on;
         let max_up = max_up.saturating_mul(fb.ticks);
@@ -184,4 +194,18 @@ pub fn sense(state: &WorldState, spec: &RuleSpec, org: &Organism) -> [f64; INPUT
         }
     }
     o
+}
+
+/// P0 body accounts + already-sealed interval feedback. Does not read post-P1 energy.
+pub fn sense_observation(
+    state: &WorldState,
+    spec: &RuleSpec,
+    org: &Organism,
+    p0_accounts: Accounts,
+    sealed_feedback: IntervalFeedback,
+) -> [f64; INPUTS] {
+    let mut view = org.clone();
+    view.accounts = p0_accounts;
+    view.last_feedback = sealed_feedback;
+    sense(state, spec, &view)
 }

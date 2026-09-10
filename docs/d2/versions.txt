@@ -1,0 +1,13 @@
+baseline_commit=4f237b0e4adddf3df42ebf782b4367e9ac2ef3ab
+d2_working_tree_dirty=true
+rustc=1.92.0
+command_tests=cargo test --offline --workspace --exclude observer --exclude narrator
+command_campaign=cargo run --offline -p universe_lab --bin d2 -- docs/d2
+base_rules_hash=6e27f665f00d508e8a49b0a9fb6409163fa4c7970ec3d58755f13b90ae180a9b
+reversal_16x16_rules_hash=34ecf5b25d8952aade89636bb8bfd83afc3aa34e44a1cb10e932578cd96931d5
+learning_rates_unchanged=true
+reward_coeffs_unchanged=true
+network_size_unchanged=true
+docs_d1_preserved=true
+docs_batches_G5_preserved=true
+f2_not_run=true

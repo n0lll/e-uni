@@ -40,6 +40,8 @@ pub enum SimError {
     Config(#[from] ConfigError),
     #[error("safety pause: {0}")]
     SafetyPause(String),
+    #[error("experiment setup: {0}")]
+    ExperimentSetup(String),
 }
 
 /// Normal world-internal failures. They do not pause the universe.
