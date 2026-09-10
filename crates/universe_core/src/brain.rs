@@ -285,12 +285,21 @@ pub fn store_grads(brain: &mut BrainState, phi: &[f64; PHI], hs: &HeadSample, al
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UpdateStats {
+    pub delta: f64,
+    pub delta_used: f64,
+    pub clipped: bool,
+    pub v_prev: f64,
+    pub v_next: f64,
+}
+
 pub fn apply_readout_update(
     brain: &mut BrainState,
     a0: &[[f64; PHI]; POLICY_LOGITS],
     phi_next: &[f64; PHI],
     spec: &RuleSpec,
-) {
+) -> UpdateStats {
     let v_prev = value(&brain.v, &brain.phi_prev);
     let v_next = value(&brain.v, phi_next);
     let delta = brain.r + brain.gamma * v_next - v_prev;
@@ -331,6 +340,13 @@ pub fn apply_readout_update(
     }
     project_rows(&mut brain.a, spec.brain.a_row_radius);
     project_l2(&mut brain.v, spec.brain.v_radius);
+    UpdateStats {
+        delta,
+        delta_used: du,
+        clipped: delta.abs() > spec.brain.delta_clip && delta.is_finite(),
+        v_prev,
+        v_next,
+    }
 }
 
 pub fn tick_reward(org: &Organism, spec: &RuleSpec, births: u64, died: bool) -> f64 {
@@ -368,15 +384,22 @@ pub fn decide(
     tick: u64,
     freeze: bool,
     allow_repro: bool,
-) -> Result<(), NumericFault> {
+) -> Result<crate::probe::DecisionDiag, NumericFault> {
     let w_in = decode_win(genome);
     let w_rec = decode_wrec(genome);
     let b_h = decode_bh(genome);
     let a0 = decode_a0(genome);
+    let interval_d = org.brain.interval_d;
+    let r = org.brain.r;
+    let h_before = org.brain.h;
+    let a_before = org.brain.a;
+    let applied = org.brain.has_pending && !freeze;
     let (h_next, phi_next) = recurrent_features(obs, &org.brain.h, &w_in, &w_rec, &b_h);
-    if org.brain.has_pending && !freeze {
-        apply_readout_update(&mut org.brain, &a0, &phi_next, spec);
-    }
+    let stats = if applied {
+        apply_readout_update(&mut org.brain, &a0, &phi_next, spec)
+    } else {
+        UpdateStats::default()
+    };
     org.brain.h = h_next;
     let hs = sample_policy(
         &org.brain.a,
@@ -407,7 +430,59 @@ pub fn decide(
     org.feedback = universe_types::IntervalFeedback::default();
     org.brain.has_pending = true;
     reset_interval(&mut org.brain);
-    Ok(())
+
+    let mut h_l2 = 0.0;
+    for i in 0..HIDDEN {
+        let d = h_next[i] - h_before[i];
+        h_l2 += d * d;
+    }
+    let mut da_bias = 0.0;
+    let mut da_feat = 0.0;
+    let mut a_minus_a0 = 0.0;
+    let mut trace_a = 0.0;
+    for i in 0..POLICY_LOGITS {
+        let db = org.brain.a[i][0] - a_before[i][0];
+        da_bias += db.abs();
+        for j in 0..PHI {
+            let d = org.brain.a[i][j] - a_before[i][j];
+            if j > 0 {
+                da_feat += d.abs();
+            }
+            let aa = org.brain.a[i][j] - a0[i][j];
+            a_minus_a0 += aa * aa;
+            trace_a += org.brain.e_a[i][j] * org.brain.e_a[i][j];
+        }
+    }
+    let mut entropy = entropy_cat(hs.p_thr) + entropy_cat(hs.p_turn);
+    for h in 0..10 {
+        let p = hs.p_bin[h];
+        if p > 0.0 && p < 1.0 {
+            entropy -= p * libm::log(p) + (1.0 - p) * libm::log(1.0 - p);
+        }
+    }
+    Ok(crate::probe::DecisionDiag {
+        tick,
+        entity_id: org.entity_id,
+        applied_update: applied,
+        interval_d,
+        r,
+        delta: stats.delta,
+        delta_used: stats.delta_used,
+        clipped: stats.clipped,
+        entropy,
+        a_minus_a0_frob: libm::sqrt(a_minus_a0),
+        trace_a_frob: libm::sqrt(trace_a),
+        h_l2_delta: libm::sqrt(h_l2),
+        input_change: 0.0,
+        da_bias_abs: da_bias,
+        da_feat_abs: da_feat,
+        v_prev: stats.v_prev,
+        v_next: stats.v_next,
+        intent_thrust: hs.thrust,
+        intent_turn: hs.turn,
+        paid_thrust: org.control.thrust,
+        paid_turn: org.control.turn,
+    })
 }
 
 pub fn install_genome_weights(org: &mut Organism, g: &Genome) {

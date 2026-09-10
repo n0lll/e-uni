@@ -30,6 +30,8 @@ pub struct Archive {
     hash_every: u64,
     snap_every: u64,
     last_batch_tick: u64,
+    /// Test hook: fail after tmp write, before rename/SQLite register.
+    pub fail_before_rename: bool,
 }
 
 impl Archive {
@@ -91,6 +93,7 @@ impl Archive {
             hash_every: spec.archive.state_hash_every_ticks.max(1),
             snap_every: spec.archive.checkpoint_every_ticks.max(1),
             last_batch_tick: 0,
+            fail_before_rename: false,
         })
     }
 
@@ -238,6 +241,12 @@ impl Archive {
                 .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
             f.sync_all()
                 .map_err(|e| SimError::ArchiveFailure(e.to_string()))?;
+        }
+        if self.fail_before_rename {
+            let _ = fs::remove_file(&tmp);
+            return Err(SimError::ArchiveFailure(
+                "injected failure before snapshot rename".into(),
+            ));
         }
         let name = format!("snap_{}.eus1", hex_hash(&content));
         let final_path = self.dir.join(&name);
@@ -474,5 +483,33 @@ mod tests {
         let b = a.clone();
         a.tick = 3;
         assert_eq!(first_diff(&a, &b).as_deref(), Some("tick"));
+    }
+
+    #[test]
+    fn rename_failure_does_not_register_snapshot() {
+        let spec = RuleSpec::eu_core_1();
+        let dir = std::env::temp_dir().join(format!(
+            "eu-arch-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut arch = Archive::open(&dir, &spec).unwrap();
+        arch.fail_before_rename = true;
+        let st = WorldState::empty(&spec, 1).unwrap();
+        let err = arch.write_snapshot(&st).unwrap_err();
+        match err {
+            SimError::ArchiveFailure(msg) => assert!(msg.contains("before snapshot rename")),
+            other => panic!("{other:?}"),
+        }
+        assert!(arch.latest_snapshot_tick(u64::MAX).unwrap().is_none());
+        let n: i64 = arch
+            .db
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

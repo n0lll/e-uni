@@ -6,6 +6,8 @@ use universe_core::rng::random_unit;
 use universe_core::world::World;
 use universe_types::{BrainState, RuleSpec, PHI, POLICY_LOGITS};
 
+pub mod d1;
+
 /// Chapter 42.4 readout reversal, one seed.
 /// Returns last-5k correct-direction fraction and mean last-step fixture reward.
 pub fn readout_reversal_one_seed(seed: u64, freeze: bool) -> (f64, f64) {
@@ -84,7 +86,7 @@ pub fn reversal_spec() -> RuleSpec {
     spec
 }
 
-fn light_right(spec: &mut RuleSpec) {
+pub(crate) fn light_right(spec: &mut RuleSpec) {
     spec.lighting.left_x0 = 10;
     spec.lighting.left_x1 = 12;
     spec.lighting.right_x0 = 10;
@@ -118,7 +120,9 @@ pub fn run_resource_reversal(seed: u64, freeze: bool, half_ticks: u64) -> Revers
         if w.state.organisms.is_empty() {
             break;
         }
-        let _ = w.step();
+        if w.step().is_err() {
+            break;
+        }
         survived = w.state.tick;
         if t >= half_ticks {
             // metab_e_new = diss * (8/2)

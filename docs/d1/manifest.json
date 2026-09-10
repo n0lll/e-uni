@@ -1,0 +1,13 @@
+{
+  "commit": "5daa29e6e7da1b8d4444cbf315409e42c3815cbc",
+  "profile": "EU-Core-1",
+  "rules_hash": "6e27f665f00d508e8a49b0a9fb6409163fa4c7970ec3d58755f13b90ae180a9b",
+  "experiment_hash": "ed239810b5f6a28a9c00d100329c99527e9dc9c61b63739682db731cdf191e63",
+  "command": "cargo run --release -p universe_lab --bin d1 -- docs/d1",
+  "switch_tick": 10000,
+  "max_ticks": 20000,
+  "seeds": [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120],
+  "p_definition": "P = E_old + E_new + 8*C (micro-units)",
+  "map": "reversal_16x16",
+  "controllers": ["Stationary", "OracleGotoLight", "ReflexQ", "Neural"]
+}

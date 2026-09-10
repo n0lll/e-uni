@@ -8,6 +8,7 @@ pub mod init;
 pub mod ledger;
 pub mod physics;
 pub mod physiology;
+pub mod probe;
 pub mod quota;
 pub mod react;
 pub mod repro;
@@ -17,7 +18,14 @@ pub mod world;
 
 pub use audit::{compute_mu, energy_identity_holds, MuTotals};
 pub use fields::{decay_s_q, phase_p5a, transport_all_fields, transport_deltas};
-pub use init::{initialize_reversal_world, initialize_world, lighting_cells};
+pub use init::{initialize_reversal_world, initialize_world, lighting_cells, lighting_centroid};
+pub use physiology::{
+    attempt_motion_cost, is_irrecoverable, maintenance_cost, pay_maintenance, pay_maintenance_parts,
+    scale_control, scale_control_parts, MaintPay, MotionPay,
+};
+pub use probe::{
+    budget_p, ControlMode, DecisionDiag, FaultPoint, RunLedger, TickProbe,
+};
 pub use ledger::{
     catabolism, commit_e_new_into_old, n_uptake, o_uptake, photosynth, repair, spend_old_energy,
     transfer_c, BodyView, CellView,
@@ -664,3 +672,6 @@ mod g4_tests {
         assert_eq!(e.e, 2_000_000);
     }
 }
+
+#[cfg(test)]
+mod d1_tests;

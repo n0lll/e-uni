@@ -23,35 +23,53 @@ pub fn is_irrecoverable(org: &Organism, spec: &RuleSpec) -> bool {
     5 * org.accounts.b < org.b_target || org.maintenance_debt >= spec.physiology.death_debt
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaintPay {
+    pub maint: u64,
+    pub repay: u64,
+}
+
+impl MaintPay {
+    pub fn total(self) -> u64 {
+        self.maint.saturating_add(self.repay)
+    }
+}
+
 pub fn pay_maintenance(
     org: &mut Organism,
     spec: &RuleSpec,
     has_embryo: bool,
 ) -> Result<u64, NumericFault> {
-    let mut diss = 0u64;
+    Ok(pay_maintenance_parts(org, spec, has_embryo)?.total())
+}
+
+pub fn pay_maintenance_parts(
+    org: &mut Organism,
+    spec: &RuleSpec,
+    has_embryo: bool,
+) -> Result<MaintPay, NumericFault> {
     let cost = maintenance_cost(org, spec, has_embryo);
     let pay = org.accounts.e_old.min(cost);
     if pay > 0 {
         org.accounts.e_old -= pay;
-        diss += pay;
     }
     let unpaid = cost - pay;
     org.maintenance_debt = org
         .maintenance_debt
         .checked_add(unpaid)
         .ok_or(NumericFault::Overflow("debt"))?;
+    let mut repay = 0u64;
     if unpaid == 0 && org.maintenance_debt > 0 && org.accounts.e_old > 0 {
-        let repay = org
+        repay = org
             .accounts
             .e_old
             .min(spec.physiology.debt_repay_per_tick)
             .min(org.maintenance_debt);
         org.accounts.e_old -= repay;
         org.maintenance_debt -= repay;
-        diss += repay;
     }
     let _ = spend_old_energy; // accounts already updated
-    Ok(diss)
+    Ok(MaintPay { maint: pay, repay })
 }
 
 pub fn deposit_death(state: &mut WorldState, spec: &RuleSpec, idx: usize) -> Result<u64, NumericFault> {
@@ -99,11 +117,32 @@ pub fn attempt_motion_cost(thrust: i8, turn: i8, spec: &RuleSpec) -> u64 {
     spec.physics.thrust_cost * u + spec.physics.turn_cost * w
 }
 
-pub fn scale_control(org: &mut Organism, spec: &RuleSpec) -> Result<u64, NumericFault> {
-    if org.marked_dead {
-        return Ok(0);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MotionPay {
+    pub thrust: u64,
+    pub turn: u64,
+}
+
+impl MotionPay {
+    pub fn total(self) -> u64 {
+        self.thrust.saturating_add(self.turn)
     }
-    let cost = attempt_motion_cost(org.control.thrust, org.control.turn, spec);
+}
+
+pub fn scale_control(org: &mut Organism, spec: &RuleSpec) -> Result<u64, NumericFault> {
+    Ok(scale_control_parts(org, spec)?.total())
+}
+
+/// P3: pay from `e_old` only. `e_new` cannot cover a shortfall. Partial pay scales both controls equally.
+pub fn scale_control_parts(org: &mut Organism, spec: &RuleSpec) -> Result<MotionPay, NumericFault> {
+    if org.marked_dead {
+        return Ok(MotionPay::default());
+    }
+    let u = org.control.thrust.unsigned_abs() as u64;
+    let w = org.control.turn.unsigned_abs() as u64;
+    let cost_u = spec.physics.thrust_cost.saturating_mul(u);
+    let cost_w = spec.physics.turn_cost.saturating_mul(w);
+    let cost = cost_u.saturating_add(cost_w);
     let s = if cost == 0 {
         1.0
     } else {
@@ -113,5 +152,11 @@ pub fn scale_control(org: &mut Organism, spec: &RuleSpec) -> Result<u64, Numeric
     org.accounts.e_old -= paid;
     org.control.u_effective = s * f64::from(org.control.thrust);
     org.control.w_effective = s * f64::from(org.control.turn);
-    Ok(paid)
+    let (thrust, turn) = if cost == 0 {
+        (0, 0)
+    } else {
+        let t = paid.saturating_mul(cost_u) / cost;
+        (t, paid.saturating_sub(t))
+    };
+    Ok(MotionPay { thrust, turn })
 }

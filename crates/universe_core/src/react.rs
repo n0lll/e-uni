@@ -55,7 +55,8 @@ fn read_cell(state: &WorldState, x: u32, y: u32) -> CellView {
     }
 }
 
-pub fn phase_p5b_uptake(state: &mut WorldState, spec: &RuleSpec) -> Result<u64, NumericFault> {
+/// Returns `(n_extent_sum, o_extent_sum)` actually applied.
+pub fn phase_p5b_uptake(state: &mut WorldState, spec: &RuleSpec) -> Result<(u64, u64), NumericFault> {
     // N uptake: shared env N + private capacity.
     let living: Vec<usize> = state
         .organisms
@@ -64,7 +65,8 @@ pub fn phase_p5b_uptake(state: &mut WorldState, spec: &RuleSpec) -> Result<u64, 
         .filter(|(_, o)| !o.marked_dead)
         .map(|(i, _)| i)
         .collect();
-    let diss = 0u64;
+    let mut n_sum = 0u64;
+    let mut o_sum = 0u64;
 
     // Group by cell for env N.
     use std::collections::BTreeMap;
@@ -112,6 +114,14 @@ pub fn phase_p5b_uptake(state: &mut WorldState, spec: &RuleSpec) -> Result<u64, 
             n_uptake(&mut body, &mut cell, x_e)?;
             write_body(&mut state.organisms[oi], body);
             write_cell(state, x, y, cell);
+            n_sum = n_sum
+                .checked_add(x_e)
+                .ok_or(NumericFault::Overflow("n_up_sum"))?;
+            state.organisms[oi].feedback.uptake_no = state.organisms[oi]
+                .feedback
+                .uptake_no
+                .checked_add(x_e)
+                .ok_or(NumericFault::Overflow("fb_up_n"))?;
         }
     }
 
@@ -158,14 +168,22 @@ pub fn phase_p5b_uptake(state: &mut WorldState, spec: &RuleSpec) -> Result<u64, 
             o_uptake(&mut body, &mut cell, x_e)?;
             write_body(&mut state.organisms[oi], body);
             write_cell(state, x, y, cell);
+            o_sum = o_sum
+                .checked_add(x_e)
+                .ok_or(NumericFault::Overflow("o_up_sum"))?;
+            state.organisms[oi].feedback.uptake_no = state.organisms[oi]
+                .feedback
+                .uptake_no
+                .checked_add(x_e)
+                .ok_or(NumericFault::Overflow("fb_up_o"))?;
         }
     }
-    let _ = diss;
     let _ = PoolType::EnvN;
-    Ok(0)
+    Ok((n_sum, o_sum))
 }
 
-pub fn phase_p5c_photo(state: &mut WorldState, spec: &RuleSpec) -> Result<u64, NumericFault> {
+/// Returns `(dissipation, photo_extent_sum)`.
+pub fn phase_p5c_photo(state: &mut WorldState, spec: &RuleSpec) -> Result<(u64, u64), NumericFault> {
     let living: Vec<usize> = state
         .organisms
         .iter()
@@ -183,6 +201,7 @@ pub fn phase_p5c_photo(state: &mut WorldState, spec: &RuleSpec) -> Result<u64, N
             .push(i);
     }
     let mut diss_all = 0u64;
+    let mut extent_all = 0u64;
     for (cell_i, members) in by_cell {
         let x = cell_i % spec.world.grid_width;
         let y = cell_i / spec.world.grid_width;
@@ -241,14 +260,24 @@ pub fn phase_p5c_photo(state: &mut WorldState, spec: &RuleSpec) -> Result<u64, N
                 .ok_or(NumericFault::Overflow("photo_d"))?;
             write_body(&mut state.organisms[oi], body);
             write_cell(state, x, y, cell);
+            extent_all = extent_all
+                .checked_add(x_e)
+                .ok_or(NumericFault::Overflow("photo_x"))?;
+            state.organisms[oi].feedback.photo_extent = state.organisms[oi]
+                .feedback
+                .photo_extent
+                .checked_add(x_e)
+                .ok_or(NumericFault::Overflow("fb_photo"))?;
         }
         let _ = priv_c;
     }
-    Ok(diss_all)
+    Ok((diss_all, extent_all))
 }
 
-pub fn phase_p5d_metab(state: &mut WorldState, spec: &RuleSpec) -> Result<u64, NumericFault> {
+/// Returns `(dissipation, E_new produced by the reaction)`.
+pub fn phase_p5d_metab(state: &mut WorldState, spec: &RuleSpec) -> Result<(u64, u64), NumericFault> {
     let mut diss_all = 0u64;
+    let mut e_new_all = 0u64;
     let n = state.organisms.len();
     for oi in 0..n {
         if state.organisms[oi].marked_dead {
@@ -278,8 +307,14 @@ pub fn phase_p5d_metab(state: &mut WorldState, spec: &RuleSpec) -> Result<u64, N
         diss_all = diss_all
             .checked_add(d.dissipation)
             .ok_or(NumericFault::Overflow("metab_d"))?;
+        let produced = max_e
+            .checked_mul(spec.reactions.metab_e_new)
+            .ok_or(NumericFault::Overflow("metab_e_sum"))?;
+        e_new_all = e_new_all
+            .checked_add(produced)
+            .ok_or(NumericFault::Overflow("metab_e_all"))?;
         write_body(&mut state.organisms[oi], body);
         write_cell(state, x, y, cell);
     }
-    Ok(diss_all)
+    Ok((diss_all, e_new_all))
 }

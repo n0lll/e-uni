@@ -22,6 +22,18 @@ pub fn lighting_cells(spec: &RuleSpec) -> Vec<(u32, u32)> {
     cells
 }
 
+/// Centre of currently lit cells in LU (cell index + 0.5). Empty lighting → (0, 0).
+pub fn lighting_centroid(spec: &RuleSpec) -> (f64, f64) {
+    let cells = lighting_cells(spec);
+    if cells.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = cells.len() as f64;
+    let sx: f64 = cells.iter().map(|&(x, _)| f64::from(x) + 0.5).sum();
+    let sy: f64 = cells.iter().map(|&(_, y)| f64::from(y) + 0.5).sum();
+    (sx / n, sy / n)
+}
+
 pub fn initialize_world(spec: &RuleSpec, root_seed: u64) -> Result<WorldState, NumericFault> {
     spec.validate()
         .map_err(|_| NumericFault::Overflow("invalid_rules"))?;
