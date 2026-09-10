@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "generator": "f2-init-v1",
+  "role": "development",
+  "recipe": "v1_left_body_right_light_keep_residual_q",
+  "x": 4.5,
+  "y": 8.5,
+  "quench_unlit_q": false,
+  "L": 200,
+  "W": 100,
+  "H": 4000,
+  "dev_seeds": [10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012],
+  "stat_seed": 20260911,
+  "bootstrap_draws": 2000,
+  "primary_metric": "restricted_time_freeze_minus_learn",
+  "positive_means": "learning recovered faster",
+  "protocol_hash": "22bd6d4aceecd6a10f833e87833a4a333be2cae9a44327d25f6e93cf9eba2155",
+  "isolation": {
+    "initial_count": 1,
+    "disable_reproduction": true,
+    "initial_O": 0,
+    "archive": "not_used"
+  }
+}

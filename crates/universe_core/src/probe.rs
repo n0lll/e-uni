@@ -7,6 +7,11 @@ pub fn budget_p(e_old: u64, e_new: u64, c: u64) -> u128 {
         .saturating_add(8u128.saturating_mul(u128::from(c)))
 }
 
+/// Signed `P = E_old + E_new + 8*C` for T_recover ΔP. Never use wrapping unsigned sub.
+pub fn budget_p_i128(e_old: u64, e_new: u64, c: u64) -> i128 {
+    i128::from(e_old) + i128::from(e_new) + 8 * i128::from(c)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TickProbe {
     pub maint_paid: u64,
@@ -22,14 +27,17 @@ pub struct TickProbe {
     pub uptake_o: u64,
     pub metab_e_new: u64,
     pub abs_dtheta: u64,
-    /// First living body, or 0 if none.
-    pub p: u128,
+    pub maint_due: u64,
+    pub maint_unpaid: u64,
+    pub cognition_due: u64,
+    pub debt_accrued: u64,
     pub e_old: u64,
     pub e_new: u64,
     pub c: u64,
     pub n: u64,
     pub b: u64,
     pub debt: u64,
+    pub p: u128,
     pub x_bits: u64,
     pub y_bits: u64,
     pub living: u32,
@@ -186,13 +194,13 @@ pub struct DecisionDiag {
     pub h_before: [f64; universe_types::HIDDEN],
     pub h_after: [f64; universe_types::HIDDEN],
     pub phi: [f64; universe_types::PHI],
-    pub actor_task_gradient_norm: f64,
-    pub entropy_term_norm: f64,
-    pub baseline_term_norm: f64,
-    pub trace_norm_before_projection: f64,
-    pub trace_norm_after_projection: f64,
-    pub update_norm_before_projection: f64,
-    pub update_norm_after_projection: f64,
+    pub actor_task_gradient_norm: Option<f64>,
+    pub entropy_term_norm: Option<f64>,
+    pub baseline_term_norm: Option<f64>,
+    pub trace_norm_before_projection: Option<f64>,
+    pub trace_norm_after_projection: Option<f64>,
+    pub update_norm_before_projection: Option<f64>,
+    pub update_norm_after_projection: Option<f64>,
 }
 
 impl Default for DecisionDiag {
@@ -237,13 +245,13 @@ impl Default for DecisionDiag {
             h_before: [0.0; universe_types::HIDDEN],
             h_after: [0.0; universe_types::HIDDEN],
             phi: [0.0; universe_types::PHI],
-            actor_task_gradient_norm: 0.0,
-            entropy_term_norm: 0.0,
-            baseline_term_norm: 0.0,
-            trace_norm_before_projection: 0.0,
-            trace_norm_after_projection: 0.0,
-            update_norm_before_projection: 0.0,
-            update_norm_after_projection: 0.0,
+            actor_task_gradient_norm: None,
+            entropy_term_norm: None,
+            baseline_term_norm: None,
+            trace_norm_before_projection: None,
+            trace_norm_after_projection: None,
+            update_norm_before_projection: None,
+            update_norm_after_projection: None,
         }
     }
 }
@@ -268,42 +276,52 @@ pub struct DecisionAggregate {
 }
 
 pub fn aggregate_decisions(diags: &[DecisionDiag]) -> DecisionAggregate {
-    let n = diags.len() as u64;
-    if n == 0 {
-        return DecisionAggregate::default();
-    }
-    let mut a = DecisionAggregate { n, ..DecisionAggregate::default() };
+    let mut a = DecisionAggregate::default();
     for d in diags {
-        a.n_updates += u64::from(d.applied_update);
-        a.n_clipped += u64::from(d.clipped);
-        a.mean_delta += d.delta;
-        a.mean_delta_used += d.delta_used;
-        a.mean_entropy += d.entropy;
-        a.mean_interval_d += d.interval_d as f64;
-        a.mean_r += d.r;
-        a.mean_input_change += d.input_change;
-        a.mean_h_l2 += d.h_l2_delta;
-        a.mean_a_minus_a0 += d.a_minus_a0_frob;
-        a.mean_u_effective += d.u_effective;
-        a.mean_w_effective += d.w_effective;
-        if d.obs[32 + 31] > 0.5 {
-            a.n_obs31_valid += 1;
-        }
-        a.mean_obs31 += d.obs[31];
+        a.push(d);
     }
-    let inv = n as f64;
-    a.mean_delta /= inv;
-    a.mean_delta_used /= inv;
-    a.mean_entropy /= inv;
-    a.mean_interval_d /= inv;
-    a.mean_r /= inv;
-    a.mean_input_change /= inv;
-    a.mean_h_l2 /= inv;
-    a.mean_a_minus_a0 /= inv;
-    a.mean_u_effective /= inv;
-    a.mean_w_effective /= inv;
-    a.mean_obs31 /= inv;
+    a.normalize_in_place();
     a
+}
+
+impl DecisionAggregate {
+    pub fn push(&mut self, d: &DecisionDiag) {
+        self.n = self.n.saturating_add(1);
+        self.n_updates += u64::from(d.applied_update);
+        self.n_clipped += u64::from(d.clipped);
+        self.mean_delta += d.delta;
+        self.mean_delta_used += d.delta_used;
+        self.mean_entropy += d.entropy;
+        self.mean_interval_d += d.interval_d as f64;
+        self.mean_r += d.r;
+        self.mean_input_change += d.input_change;
+        self.mean_h_l2 += d.h_l2_delta;
+        self.mean_a_minus_a0 += d.a_minus_a0_frob;
+        self.mean_u_effective += d.u_effective;
+        self.mean_w_effective += d.w_effective;
+        if d.obs[32 + 31] > 0.5 {
+            self.n_obs31_valid += 1;
+        }
+        self.mean_obs31 += d.obs[31];
+    }
+
+    pub fn normalize_in_place(&mut self) {
+        if self.n == 0 {
+            return;
+        }
+        let inv = self.n as f64;
+        self.mean_delta /= inv;
+        self.mean_delta_used /= inv;
+        self.mean_entropy /= inv;
+        self.mean_interval_d /= inv;
+        self.mean_r /= inv;
+        self.mean_input_change /= inv;
+        self.mean_h_l2 /= inv;
+        self.mean_a_minus_a0 /= inv;
+        self.mean_u_effective /= inv;
+        self.mean_w_effective /= inv;
+        self.mean_obs31 /= inv;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -324,6 +342,40 @@ impl ControlMode {
             Self::Forced { .. } => 2,
             Self::OracleGotoLight => 3,
             Self::ReflexQ => 4,
+        }
+    }
+
+    /// Versioned encoding: version byte, variant, then Forced thrust/turn (0 for others).
+    pub fn encode_canonical(self, w: &mut universe_types::CanonWriter) {
+        w.u8(1);
+        w.u8(self.code());
+        match self {
+            Self::Forced { thrust, turn } => {
+                w.i8(thrust);
+                w.i8(turn);
+            }
+            _ => {
+                w.i8(0);
+                w.i8(0);
+            }
+        }
+    }
+
+    pub fn decode_canonical(r: &mut universe_types::CanonReader) -> Result<Self, universe_types::NumericFault> {
+        let ver = r.u8()?;
+        if ver != 1 {
+            return Err(universe_types::NumericFault::Overflow("control_enc_ver"));
+        }
+        let code = r.u8()?;
+        let thrust = r.i8()?;
+        let turn = r.i8()?;
+        match code {
+            0 => Ok(Self::Neural),
+            1 => Ok(Self::Stationary),
+            2 => Ok(Self::Forced { thrust, turn }),
+            3 => Ok(Self::OracleGotoLight),
+            4 => Ok(Self::ReflexQ),
+            _ => Err(universe_types::NumericFault::Overflow("control_code")),
         }
     }
 

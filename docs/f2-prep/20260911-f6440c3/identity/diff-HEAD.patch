@@ -1,0 +1,1186 @@
+﻿diff --git a/Cargo.lock b/Cargo.lock
+index bd9d6db..e91ddd5 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -394,6 +394,8 @@ version = "0.1.0"
+ dependencies = [
+  "hex",
+  "narrator",
++ "serde",
++ "serde_yaml",
+  "universe_archive",
+  "universe_core",
+  "universe_types",
+diff --git a/crates/universe_core/src/brain.rs b/crates/universe_core/src/brain.rs
+index 44cb9e9..3b8e8cd 100644
+--- a/crates/universe_core/src/brain.rs
++++ b/crates/universe_core/src/brain.rs
+@@ -38,7 +38,23 @@ pub fn recurrent_features(
+     (h_next, phi)
+ }
+ 
+-fn logits(a: &[[f64; PHI]; POLICY_LOGITS], phi: &[f64; PHI]) -> [f64; POLICY_LOGITS] {
++fn require_finite(x: f64, _tag: &'static str) -> Result<(), NumericFault> {
++    if x.is_finite() {
++        Ok(())
++    } else {
++        Err(NumericFault::NonFinite)
++    }
++}
++
++fn logits(a: &[[f64; PHI]; POLICY_LOGITS], phi: &[f64; PHI]) -> Result<[f64; POLICY_LOGITS], NumericFault> {
++    for row in a {
++        for &v in row {
++            require_finite(v, "A")?;
++        }
++    }
++    for &v in phi {
++        require_finite(v, "phi")?;
++    }
+     let mut y = [0.0; POLICY_LOGITS];
+     for i in 0..POLICY_LOGITS {
+         let mut s = 0.0;
+@@ -47,7 +63,7 @@ fn logits(a: &[[f64; PHI]; POLICY_LOGITS], phi: &[f64; PHI]) -> [f64; POLICY_LOG
+         }
+         y[i] = s;
+     }
+-    y
++    Ok(y)
+ }
+ 
+ pub fn value(v: &[f64; PHI], phi: &[f64; PHI]) -> f64 {
+@@ -67,6 +83,21 @@ fn softmax3(z: [f64; 3]) -> [f64; 3] {
+     [e0 / s, e1 / s, e2 / s]
+ }
+ 
++/// Legal class masks may be 鈭掆垶. NaN or +鈭?in a participating logit is a fault.
++fn softmax3_checked(z: [f64; 3]) -> Result<[f64; 3], NumericFault> {
++    if z.iter().any(|x| x.is_nan() || *x == f64::INFINITY) {
++        return Err(NumericFault::NonFinite);
++    }
++    if !z.iter().any(|x| x.is_finite()) {
++        return Err(NumericFault::NonFinite);
++    }
++    let p = softmax3(z);
++    if p.iter().any(|x| !x.is_finite()) {
++        return Err(NumericFault::NonFinite);
++    }
++    Ok(p)
++}
++
+ fn sigmoid(z: f64) -> f64 {
+     1.0 / (1.0 + libm::exp(-z))
+ }
+@@ -200,13 +231,19 @@ pub fn sample_policy_masked(
+     allow_repro: bool,
+     mask_idle_thrust: bool,
+ ) -> Result<HeadSample, NumericFault> {
+-    let mut z = logits(a, phi);
++    let mut z = logits(a, phi)?;
++    for (i, &zi) in z.iter().enumerate() {
++        let legally_masked = i >= 12 || (i == 11 && !allow_repro) || (i == 1 && mask_idle_thrust);
++        if !legally_masked && !zi.is_finite() {
++            return Err(NumericFault::NonFinite);
++        }
++    }
+     mask_policy(&mut z, allow_repro);
+     if mask_idle_thrust {
+         z[1] = f64::NEG_INFINITY;
+     }
+-    let p_thr = softmax3([z[0], z[1], z[2]]);
+-    let p_turn = softmax3([z[3], z[4], z[5]]);
++    let p_thr = softmax3_checked([z[0], z[1], z[2]])?;
++    let p_turn = softmax3_checked([z[3], z[4], z[5]])?;
+     let u0 = random_unit(root_seed, RngDomain::PolicySample.code(), tick, entity, 0, 0)?;
+     let u1 = random_unit(root_seed, RngDomain::PolicySample.code(), tick, entity, 0, 1)?;
+     let a_thr = sample_cat3(p_thr, u0);
+@@ -214,13 +251,8 @@ pub fn sample_policy_masked(
+     let mut binary = [false; 10];
+     let mut p_bin = [0.0; 10];
+     for h in 0..10 {
+-        let p = if z[6 + h].is_finite() {
+-            sigmoid(z[6 + h])
+-        } else {
+-            0.0
+-        };
+-        p_bin[h] = p;
+-        // still consume RNG slots for masked heads: j = 2+h because thrust/turn used j=0,1
++        let logit_i = 6 + h;
++        let legally_masked = h >= 6 || (h == 5 && !allow_repro);
+         let u = random_unit(
+             root_seed,
+             RngDomain::PolicySample.code(),
+@@ -229,7 +261,20 @@ pub fn sample_policy_masked(
+             0,
+             2 + h as u64,
+         )?;
+-        binary[h] = z[6 + h].is_finite() && u < p;
++        if legally_masked {
++            p_bin[h] = 0.0;
++            binary[h] = false;
++            continue;
++        }
++        if !z[logit_i].is_finite() {
++            return Err(NumericFault::NonFinite);
++        }
++        let p = sigmoid(z[logit_i]);
++        if !p.is_finite() {
++            return Err(NumericFault::NonFinite);
++        }
++        p_bin[h] = p;
++        binary[h] = u < p;
+     }
+     Ok(HeadSample {
+         thrust: a_thr as i8 - 1,
+@@ -292,6 +337,16 @@ pub struct UpdateStats {
+     pub clipped: bool,
+     pub v_prev: f64,
+     pub v_next: f64,
++    /// 鈥朼ctor_lr 路 未_used 路 e_A鈥朹F after traces, coefficients included.
++    pub actor_task_gradient_norm: Option<f64>,
++    /// 鈥朼ctor_lr 路 entropy_coef 路 鈭嘓鈥朹F
++    pub entropy_term_norm: Option<f64>,
++    /// 鈥朼ctor_lr 路 baseline_coef 路 (A鈭扐0)鈥朹F
++    pub baseline_term_norm: Option<f64>,
++    pub trace_norm_before_projection: Option<f64>,
++    pub trace_norm_after_projection: Option<f64>,
++    pub update_norm_before_projection: Option<f64>,
++    pub update_norm_after_projection: Option<f64>,
+ }
+ 
+ pub fn apply_readout_update(
+@@ -299,54 +354,82 @@ pub fn apply_readout_update(
+     a0: &[[f64; PHI]; POLICY_LOGITS],
+     phi_next: &[f64; PHI],
+     spec: &RuleSpec,
+-) -> UpdateStats {
++) -> Result<UpdateStats, NumericFault> {
++    for &x in phi_next {
++        require_finite(x, "phi_next")?;
++    }
+     let v_prev = value(&brain.v, &brain.phi_prev);
+     let v_next = value(&brain.v, phi_next);
++    require_finite(v_prev, "v_prev")?;
++    require_finite(v_next, "v_next")?;
++    require_finite(brain.r, "R")?;
++    require_finite(brain.gamma, "gamma")?;
+     let delta = brain.r + brain.gamma * v_next - v_prev;
++    require_finite(delta, "delta")?;
+     brain.last_delta = delta;
+     let du = delta.clamp(-spec.brain.delta_clip, spec.brain.delta_clip);
+-    // traces
+     for i in 0..POLICY_LOGITS {
+         for j in 0..PHI {
+             brain.e_a[i][j] = brain.trace_decay * brain.e_a[i][j] + brain.grad_log[i][j];
++            require_finite(brain.e_a[i][j], "e_a")?;
+         }
+     }
+     for j in 0..PHI {
+         brain.e_v[j] = brain.trace_decay * brain.e_v[j] + brain.phi_prev[j];
++        require_finite(brain.e_v[j], "e_v")?;
+     }
++    let trace_before = frobenius(&brain.e_a);
+     project_frob(&mut brain.e_a, spec.brain.e_a_radius);
+     project_l2(&mut brain.e_v, spec.brain.e_v_radius);
++    let trace_after = frobenius(&brain.e_a);
++    let mut task = [[0.0; PHI]; POLICY_LOGITS];
++    let mut ent = [[0.0; PHI]; POLICY_LOGITS];
++    let mut base = [[0.0; PHI]; POLICY_LOGITS];
+     let mut da = [[0.0; PHI]; POLICY_LOGITS];
+     for i in 0..POLICY_LOGITS {
+         for j in 0..PHI {
+-            da[i][j] = spec.brain.actor_lr
+-                * (du * brain.e_a[i][j] + spec.brain.entropy_coef * brain.grad_ent[i][j]
+-                    - spec.brain.baseline_coef * (brain.a[i][j] - a0[i][j]));
++            task[i][j] = spec.brain.actor_lr * du * brain.e_a[i][j];
++            ent[i][j] = spec.brain.actor_lr * spec.brain.entropy_coef * brain.grad_ent[i][j];
++            base[i][j] = spec.brain.actor_lr * spec.brain.baseline_coef * (brain.a[i][j] - a0[i][j]);
++            da[i][j] = task[i][j] + ent[i][j] - base[i][j];
++            require_finite(da[i][j], "da")?;
+         }
+     }
+     let mut dv = [0.0; PHI];
+     for j in 0..PHI {
+         dv[j] = spec.brain.critic_lr * du * brain.e_v[j];
++        require_finite(dv[j], "dv")?;
+     }
++    let update_before = frobenius(&da);
+     project_frob(&mut da, spec.brain.d_a_radius);
+     project_l2(&mut dv, spec.brain.d_v_radius);
++    let update_after = frobenius(&da);
+     for i in 0..POLICY_LOGITS {
+         for j in 0..PHI {
+             brain.a[i][j] += da[i][j];
++            require_finite(brain.a[i][j], "A")?;
+         }
+     }
+     for j in 0..PHI {
+         brain.v[j] += dv[j];
++        require_finite(brain.v[j], "v")?;
+     }
+     project_rows(&mut brain.a, spec.brain.a_row_radius);
+     project_l2(&mut brain.v, spec.brain.v_radius);
+-    UpdateStats {
++    Ok(UpdateStats {
+         delta,
+         delta_used: du,
+         clipped: delta.abs() > spec.brain.delta_clip && delta.is_finite(),
+         v_prev,
+         v_next,
+-    }
++        actor_task_gradient_norm: Some(frobenius(&task)),
++        entropy_term_norm: Some(frobenius(&ent)),
++        baseline_term_norm: Some(frobenius(&base)),
++        trace_norm_before_projection: Some(trace_before),
++        trace_norm_after_projection: Some(trace_after),
++        update_norm_before_projection: Some(update_before),
++        update_norm_after_projection: Some(update_after),
++    })
+ }
+ 
+ pub fn tick_reward(org: &Organism, spec: &RuleSpec, births: u64, died: bool) -> f64 {
+@@ -395,8 +478,14 @@ pub fn decide(
+     let a_before = org.brain.a;
+     let applied = org.brain.has_pending && !freeze;
+     let (h_next, phi_next) = recurrent_features(obs, &org.brain.h, &w_in, &w_rec, &b_h);
++    for &x in obs {
++        require_finite(x, "obs")?;
++    }
++    for &x in &h_next {
++        require_finite(x, "h")?;
++    }
+     let stats = if applied {
+-        apply_readout_update(&mut org.brain, &a0, &phi_next, spec)
++        apply_readout_update(&mut org.brain, &a0, &phi_next, spec)?
+     } else {
+         UpdateStats::default()
+     };
+@@ -492,6 +581,13 @@ pub fn decide(
+         h_before,
+         h_after: h_next,
+         phi: phi_next,
++        actor_task_gradient_norm: stats.actor_task_gradient_norm,
++        entropy_term_norm: stats.entropy_term_norm,
++        baseline_term_norm: stats.baseline_term_norm,
++        trace_norm_before_projection: stats.trace_norm_before_projection,
++        trace_norm_after_projection: stats.trace_norm_after_projection,
++        update_norm_before_projection: stats.update_norm_before_projection,
++        update_norm_after_projection: stats.update_norm_after_projection,
+         ..crate::probe::DecisionDiag::default()
+     })
+ }
+diff --git a/crates/universe_core/src/d2_tests.rs b/crates/universe_core/src/d2_tests.rs
+index 364500e..ec64e1a 100644
+--- a/crates/universe_core/src/d2_tests.rs
++++ b/crates/universe_core/src/d2_tests.rs
+@@ -413,3 +413,192 @@ fn p0_energy_not_post_maintenance() {
+     assert!((frame.obs[20] - want).abs() < 1e-12);
+     assert!(w.last_probe.maint_paid + w.last_probe.cognition > 0);
+ }
++
++#[test]
++fn f01_nan_unmasked_nboost_is_numeric_fault() {
++    use crate::brain::sample_policy;
++    let spec = reversal_spec();
++    let st = initialize_reversal_world(&spec, 3).unwrap();
++    let mut a = st.organisms[0].brain.a;
++    let mut phi = [0.0; universe_types::PHI];
++    phi[0] = 1.0;
++    let ok = sample_policy(&a, &phi, 3, 0, 1, false).unwrap();
++    assert!(ok.p_bin[0].is_finite());
++    a[6][0] = f64::NAN;
++    match sample_policy(&a, &phi, 3, 0, 1, false) {
++        Err(NumericFault::NonFinite) => {}
++        Err(e) => panic!("expected NonFinite, got {e}"),
++        Ok(_) => panic!("expected NonFinite, got Ok"),
++    }
++    a[6][0] = f64::INFINITY;
++    match sample_policy(&a, &phi, 3, 0, 1, false) {
++        Err(NumericFault::NonFinite) => {}
++        Err(e) => panic!("expected NonFinite, got {e}"),
++        Ok(_) => panic!("expected NonFinite, got Ok"),
++    }
++}
++
++#[test]
++fn f01_plus_inf_softmax_rejected_legal_mask_ok() {
++    use crate::brain::sample_policy;
++    let spec = reversal_spec();
++    let st = initialize_reversal_world(&spec, 3).unwrap();
++    let mut a = st.organisms[0].brain.a;
++    let mut phi = [0.0; universe_types::PHI];
++    phi[0] = 1.0;
++    sample_policy(&a, &phi, 3, 0, 1, false).unwrap();
++    a[0][0] = f64::INFINITY;
++    match sample_policy(&a, &phi, 3, 0, 1, false) {
++        Err(NumericFault::NonFinite) => {}
++        Err(e) => panic!("expected NonFinite, got {e}"),
++        Ok(_) => panic!("expected NonFinite, got Ok"),
++    }
++    let finite = st.organisms[0].brain.a;
++    crate::brain::sample_policy_masked(&finite, &phi, 3, 0, 1, false, true).unwrap();
++}
++
++#[test]
++fn f01_world_step_rolls_back_on_nan() {
++    let spec = reversal_spec();
++    let st = initialize_reversal_world(&spec, 21).unwrap();
++    let mut w = World::from_state(spec, st);
++    w.disable_reproduction = true;
++    w.control_mode = ControlMode::Neural;
++    let tick = w.state.tick;
++    let e = w.state.organisms[0].accounts.e_old;
++    let executed = w.run_ledger.executed_ticks;
++    let a00 = w.state.organisms[0].brain.a[0][0];
++    w.state.organisms[0].brain.a[6][0] = f64::NAN;
++    match w.step() {
++        Err(SimError::Numeric(NumericFault::NonFinite)) => {}
++        Err(e) => panic!("expected NonFinite, got {e}"),
++        Ok(()) => panic!("expected NonFinite, got Ok"),
++    }
++    assert_eq!(w.state.tick, tick);
++    assert_eq!(w.state.organisms[0].accounts.e_old, e);
++    assert_eq!(w.run_ledger.executed_ticks, executed);
++    assert_eq!(w.state.organisms[0].brain.a[0][0], a00);
++    assert!(w.state.organisms[0].brain.a[6][0].is_nan());
++    assert!(w.last_events.is_empty());
++}
++
++#[test]
++fn f08_disable_motion_overrides_forced_and_keeps_photo() {
++    let spec = reversal_spec();
++    let mut st = initialize_reversal_world(&spec, 9).unwrap();
++    st.organisms[0].geom.x = 4.5;
++    st.organisms[0].geom.y = 8.5;
++    st.organisms[0].geom.theta = 0.0;
++    let mut w = World::from_state(spec, st);
++    w.disable_reproduction = true;
++    w.disable_active_motion = true;
++    w.control_mode = ControlMode::Forced {
++        thrust: 1,
++        turn: 1,
++    };
++    w.freeze_learning = true;
++    for _ in 0..8 {
++        w.step().unwrap();
++    }
++    assert_eq!(w.run_ledger.thrust_attempt, 0);
++    assert_eq!(w.run_ledger.turn_attempt, 0);
++    assert!(
++        w.run_ledger.photo_extent > 0,
++        "motion disable must not turn off photosynthesis"
++    );
++}
++
++#[test]
++fn f04_update_norms_are_measured_not_placeholder_zero() {
++    let spec = reversal_spec();
++    let st = initialize_reversal_world(&spec, 21).unwrap();
++    let mut w = World::from_state(spec, st);
++    w.disable_reproduction = true;
++    w.freeze_learning = false;
++    w.control_mode = ControlMode::Neural;
++    w.enable_probe = true;
++    for _ in 0..6 {
++        w.step().unwrap();
++    }
++    let d0 = w.last_decisions.iter().find(|d| d.tick == 0).unwrap();
++    assert!(!d0.applied_update);
++    assert!(d0.actor_task_gradient_norm.is_none());
++    let d5 = w.last_decisions.iter().find(|d| d.tick == 5).unwrap();
++    assert!(d5.applied_update);
++    let n = d5.actor_task_gradient_norm.expect("task norm");
++    assert!(n.is_finite());
++    assert!(d5.entropy_term_norm.unwrap().is_finite());
++    assert!(d5.trace_norm_after_projection.unwrap().is_finite());
++}
++
++#[test]
++fn f04_probe_frames_are_bounded() {
++    let spec = reversal_spec();
++    let st = initialize_reversal_world(&spec, 7).unwrap();
++    let mut w = World::from_state(spec, st);
++    w.disable_reproduction = true;
++    w.freeze_learning = true;
++    w.control_mode = ControlMode::Stationary;
++    w.enable_probe = true;
++    w.probe_frame_limit = 3;
++    for _ in 0..40 {
++        w.step().unwrap();
++    }
++    assert!(w.last_decisions.len() <= 3);
++    assert!(w.probe_aggregate.n > 3);
++}
++
++#[test]
++fn f04_probe_does_not_change_state_hash() {
++    let spec = reversal_spec();
++    let st = initialize_reversal_world(&spec, 8).unwrap();
++    let mut a = World::from_state(spec.clone(), st.clone());
++    let mut b = World::from_state(spec, st);
++    a.disable_reproduction = true;
++    b.disable_reproduction = true;
++    a.freeze_learning = true;
++    b.freeze_learning = true;
++    a.control_mode = ControlMode::Stationary;
++    b.control_mode = ControlMode::Stationary;
++    a.enable_probe = true;
++    b.enable_probe = false;
++    for _ in 0..10 {
++        a.step().unwrap();
++        b.step().unwrap();
++    }
++    assert_eq!(state_hash(&a.state).unwrap(), state_hash(&b.state).unwrap());
++}
++
++#[test]
++fn f07_validate_lab_rejects_zero_divisors() {
++    let mut spec = reversal_spec();
++    spec.world.q_loss_divisor = 0;
++    assert!(spec.validate_lab().is_err());
++    spec = reversal_spec();
++    spec.physics.substeps = 0;
++    assert!(spec.validate_lab().is_err());
++    spec = reversal_spec();
++    spec.brain.leak_old = 0.5;
++    assert!(spec.validate_lab().is_err());
++}
++
++#[test]
++fn f04_known_update_norms_match_formula() {
++    use crate::brain::apply_readout_update;
++    use universe_types::{BrainState, PHI, POLICY_LOGITS};
++    let spec = reversal_spec();
++    let mut brain = BrainState::zeroed();
++    brain.phi_prev[0] = 1.0;
++    brain.e_a[0][0] = 2.0;
++    brain.r = 1.0;
++    brain.gamma = 0.0;
++    let a0 = [[0.0; PHI]; POLICY_LOGITS];
++    let mut phi = [0.0; PHI];
++    phi[0] = 1.0;
++    let stats = apply_readout_update(&mut brain, &a0, &phi, &spec).unwrap();
++    let task = stats.actor_task_gradient_norm.unwrap();
++    let expect = spec.brain.actor_lr * 1.0 * 2.0;
++    assert!((task - expect).abs() < 1e-12, "task={task} expect={expect}");
++    assert!(stats.entropy_term_norm.unwrap().abs() < 1e-15);
++}
++
+diff --git a/crates/universe_core/src/lib.rs b/crates/universe_core/src/lib.rs
+index 64be591..ffa439b 100644
+--- a/crates/universe_core/src/lib.rs
++++ b/crates/universe_core/src/lib.rs
+@@ -27,9 +27,10 @@ pub use physiology::{
+     scale_control, scale_control_parts, MaintPay, MotionPay,
+ };
+ pub use probe::{
+-    aggregate_decisions, budget_p, ControlMode, DecisionAggregate, DecisionDiag, DecisionSkip,
+-    FaultPoint, ObservationFrame, RunLedger, TickProbe,
++    aggregate_decisions, budget_p, budget_p_i128, ControlMode, DecisionAggregate, DecisionDiag,
++    DecisionSkip, FaultPoint, ObservationFrame, RunLedger, TickProbe,
+ };
++pub use world::{validate_loaded_world, World};
+ pub use ledger::{
+     catabolism, commit_e_new_into_old, n_uptake, o_uptake, photosynth, repair, spend_old_energy,
+     transfer_c, BodyView, CellView,
+@@ -39,7 +40,6 @@ pub use rng::{
+     encode_key_counter, geometry_draw_index, philox4x32_10, quota_draw_index, random_range,
+     random_u32, random_u32_domain, random_unit, ObserverRng,
+ };
+-pub use world::World;
+ 
+ 
+ #[cfg(test)]
+@@ -455,7 +455,7 @@ mod g3_tests {
+             p
+         };
+         let p_before = 1.0 / (1.0 + libm::exp(-brain.a[6][0]));
+-        apply_readout_update(&mut brain, &a0, &phi_next, &spec);
++        apply_readout_update(&mut brain, &a0, &phi_next, &spec).unwrap();
+         let p_after = 1.0 / (1.0 + libm::exp(-brain.a[6][0]));
+         assert!(p_after > p_before);
+     }
+@@ -493,7 +493,7 @@ mod g3_tests {
+             p[0] = 1.0;
+             p
+         };
+-        apply_readout_update(&mut st.organisms[0].brain, &a0, &phi, &spec);
++        apply_readout_update(&mut st.organisms[0].brain, &a0, &phi, &spec).unwrap();
+         assert_ne!(st.organisms[0].brain.a[0][0].to_bits(), a0[0][0].to_bits());
+         assert_eq!(st.organisms[1].brain.as_ref(), b_before.as_ref());
+     }
+diff --git a/crates/universe_core/src/probe.rs b/crates/universe_core/src/probe.rs
+index c09541c..7856a3a 100644
+--- a/crates/universe_core/src/probe.rs
++++ b/crates/universe_core/src/probe.rs
+@@ -7,6 +7,11 @@ pub fn budget_p(e_old: u64, e_new: u64, c: u64) -> u128 {
+         .saturating_add(8u128.saturating_mul(u128::from(c)))
+ }
+ 
++/// Signed `P = E_old + E_new + 8*C` for T_recover 螖P. Never use wrapping unsigned sub.
++pub fn budget_p_i128(e_old: u64, e_new: u64, c: u64) -> i128 {
++    i128::from(e_old) + i128::from(e_new) + 8 * i128::from(c)
++}
++
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+ pub struct TickProbe {
+     pub maint_paid: u64,
+@@ -22,14 +27,17 @@ pub struct TickProbe {
+     pub uptake_o: u64,
+     pub metab_e_new: u64,
+     pub abs_dtheta: u64,
+-    /// First living body, or 0 if none.
+-    pub p: u128,
++    pub maint_due: u64,
++    pub maint_unpaid: u64,
++    pub cognition_due: u64,
++    pub debt_accrued: u64,
+     pub e_old: u64,
+     pub e_new: u64,
+     pub c: u64,
+     pub n: u64,
+     pub b: u64,
+     pub debt: u64,
++    pub p: u128,
+     pub x_bits: u64,
+     pub y_bits: u64,
+     pub living: u32,
+@@ -186,13 +194,13 @@ pub struct DecisionDiag {
+     pub h_before: [f64; universe_types::HIDDEN],
+     pub h_after: [f64; universe_types::HIDDEN],
+     pub phi: [f64; universe_types::PHI],
+-    pub actor_task_gradient_norm: f64,
+-    pub entropy_term_norm: f64,
+-    pub baseline_term_norm: f64,
+-    pub trace_norm_before_projection: f64,
+-    pub trace_norm_after_projection: f64,
+-    pub update_norm_before_projection: f64,
+-    pub update_norm_after_projection: f64,
++    pub actor_task_gradient_norm: Option<f64>,
++    pub entropy_term_norm: Option<f64>,
++    pub baseline_term_norm: Option<f64>,
++    pub trace_norm_before_projection: Option<f64>,
++    pub trace_norm_after_projection: Option<f64>,
++    pub update_norm_before_projection: Option<f64>,
++    pub update_norm_after_projection: Option<f64>,
+ }
+ 
+ impl Default for DecisionDiag {
+@@ -237,13 +245,13 @@ impl Default for DecisionDiag {
+             h_before: [0.0; universe_types::HIDDEN],
+             h_after: [0.0; universe_types::HIDDEN],
+             phi: [0.0; universe_types::PHI],
+-            actor_task_gradient_norm: 0.0,
+-            entropy_term_norm: 0.0,
+-            baseline_term_norm: 0.0,
+-            trace_norm_before_projection: 0.0,
+-            trace_norm_after_projection: 0.0,
+-            update_norm_before_projection: 0.0,
+-            update_norm_after_projection: 0.0,
++            actor_task_gradient_norm: None,
++            entropy_term_norm: None,
++            baseline_term_norm: None,
++            trace_norm_before_projection: None,
++            trace_norm_after_projection: None,
++            update_norm_before_projection: None,
++            update_norm_after_projection: None,
+         }
+     }
+ }
+@@ -268,42 +276,52 @@ pub struct DecisionAggregate {
+ }
+ 
+ pub fn aggregate_decisions(diags: &[DecisionDiag]) -> DecisionAggregate {
+-    let n = diags.len() as u64;
+-    if n == 0 {
+-        return DecisionAggregate::default();
+-    }
+-    let mut a = DecisionAggregate { n, ..DecisionAggregate::default() };
++    let mut a = DecisionAggregate::default();
+     for d in diags {
+-        a.n_updates += u64::from(d.applied_update);
+-        a.n_clipped += u64::from(d.clipped);
+-        a.mean_delta += d.delta;
+-        a.mean_delta_used += d.delta_used;
+-        a.mean_entropy += d.entropy;
+-        a.mean_interval_d += d.interval_d as f64;
+-        a.mean_r += d.r;
+-        a.mean_input_change += d.input_change;
+-        a.mean_h_l2 += d.h_l2_delta;
+-        a.mean_a_minus_a0 += d.a_minus_a0_frob;
+-        a.mean_u_effective += d.u_effective;
+-        a.mean_w_effective += d.w_effective;
++        a.push(d);
++    }
++    a.normalize_in_place();
++    a
++}
++
++impl DecisionAggregate {
++    pub fn push(&mut self, d: &DecisionDiag) {
++        self.n = self.n.saturating_add(1);
++        self.n_updates += u64::from(d.applied_update);
++        self.n_clipped += u64::from(d.clipped);
++        self.mean_delta += d.delta;
++        self.mean_delta_used += d.delta_used;
++        self.mean_entropy += d.entropy;
++        self.mean_interval_d += d.interval_d as f64;
++        self.mean_r += d.r;
++        self.mean_input_change += d.input_change;
++        self.mean_h_l2 += d.h_l2_delta;
++        self.mean_a_minus_a0 += d.a_minus_a0_frob;
++        self.mean_u_effective += d.u_effective;
++        self.mean_w_effective += d.w_effective;
+         if d.obs[32 + 31] > 0.5 {
+-            a.n_obs31_valid += 1;
++            self.n_obs31_valid += 1;
+         }
+-        a.mean_obs31 += d.obs[31];
++        self.mean_obs31 += d.obs[31];
++    }
++
++    pub fn normalize_in_place(&mut self) {
++        if self.n == 0 {
++            return;
++        }
++        let inv = self.n as f64;
++        self.mean_delta /= inv;
++        self.mean_delta_used /= inv;
++        self.mean_entropy /= inv;
++        self.mean_interval_d /= inv;
++        self.mean_r /= inv;
++        self.mean_input_change /= inv;
++        self.mean_h_l2 /= inv;
++        self.mean_a_minus_a0 /= inv;
++        self.mean_u_effective /= inv;
++        self.mean_w_effective /= inv;
++        self.mean_obs31 /= inv;
+     }
+-    let inv = n as f64;
+-    a.mean_delta /= inv;
+-    a.mean_delta_used /= inv;
+-    a.mean_entropy /= inv;
+-    a.mean_interval_d /= inv;
+-    a.mean_r /= inv;
+-    a.mean_input_change /= inv;
+-    a.mean_h_l2 /= inv;
+-    a.mean_a_minus_a0 /= inv;
+-    a.mean_u_effective /= inv;
+-    a.mean_w_effective /= inv;
+-    a.mean_obs31 /= inv;
+-    a
+ }
+ 
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+@@ -327,6 +345,40 @@ impl ControlMode {
+         }
+     }
+ 
++    /// Versioned encoding: version byte, variant, then Forced thrust/turn (0 for others).
++    pub fn encode_canonical(self, w: &mut universe_types::CanonWriter) {
++        w.u8(1);
++        w.u8(self.code());
++        match self {
++            Self::Forced { thrust, turn } => {
++                w.i8(thrust);
++                w.i8(turn);
++            }
++            _ => {
++                w.i8(0);
++                w.i8(0);
++            }
++        }
++    }
++
++    pub fn decode_canonical(r: &mut universe_types::CanonReader) -> Result<Self, universe_types::NumericFault> {
++        let ver = r.u8()?;
++        if ver != 1 {
++            return Err(universe_types::NumericFault::Overflow("control_enc_ver"));
++        }
++        let code = r.u8()?;
++        let thrust = r.i8()?;
++        let turn = r.i8()?;
++        match code {
++            0 => Ok(Self::Neural),
++            1 => Ok(Self::Stationary),
++            2 => Ok(Self::Forced { thrust, turn }),
++            3 => Ok(Self::OracleGotoLight),
++            4 => Ok(Self::ReflexQ),
++            _ => Err(universe_types::NumericFault::Overflow("control_code")),
++        }
++    }
++
+     pub fn label(self) -> String {
+         match self {
+             Self::Neural => "Neural".into(),
+diff --git a/crates/universe_core/src/world.rs b/crates/universe_core/src/world.rs
+index 7601242..d9916d0 100644
+--- a/crates/universe_core/src/world.rs
++++ b/crates/universe_core/src/world.rs
+@@ -42,8 +42,12 @@ pub struct World {
+     pub last_skips: Vec<DecisionSkip>,
+     pub last_observation: std::collections::HashMap<u64, ObservationFrame>,
+     last_obs: std::collections::HashMap<u64, [f64; INPUTS]>,
++    pub probe_frame_limit: usize,
++    pub probe_aggregate: crate::probe::DecisionAggregate,
+ }
+ 
++pub const DEFAULT_PROBE_FRAME_LIMIT: usize = 256;
++
+ impl World {
+     pub fn from_state(spec: RuleSpec, state: WorldState) -> Self {
+         Self {
+@@ -64,9 +68,19 @@ impl World {
+             last_skips: Vec::new(),
+             last_observation: std::collections::HashMap::new(),
+             last_obs: std::collections::HashMap::new(),
++            probe_frame_limit: DEFAULT_PROBE_FRAME_LIMIT,
++            probe_aggregate: crate::probe::DecisionAggregate::default(),
+         }
+     }
+ 
++    /// Validated constructor for F2 load/restore. `from_state` remains an
++    /// internal entry without these checks.
++    pub fn from_state_checked(spec: RuleSpec, state: WorldState) -> Result<Self, SimError> {
++        spec.validate_lab()?;
++        validate_loaded_world(&spec, &state)?;
++        Ok(Self::from_state(spec, state))
++    }
++
+     pub fn apply_runtime(
+         &mut self,
+         freeze_learning: bool,
+@@ -107,6 +121,7 @@ impl World {
+         let skips = self.last_skips.clone();
+         let frames = self.last_observation.clone();
+         let obs = self.last_obs.clone();
++        let probe_agg = self.probe_aggregate.clone();
+         let metab_diss = self.last_metab_diss;
+         let metab_e = self.last_metab_e_new;
+         match self.step_apply() {
+@@ -120,6 +135,7 @@ impl World {
+                 self.last_skips = skips;
+                 self.last_observation = frames;
+                 self.last_obs = obs;
++                self.probe_aggregate = probe_agg;
+                 self.last_metab_diss = metab_diss;
+                 self.last_metab_e_new = metab_e;
+                 if matches!(&e, SimError::Numeric(NumericFault::Overflow("contact_pairs"))) {
+@@ -279,6 +295,19 @@ impl World {
+             maint_diss = maint_diss
+                 .checked_add(pay.total())
+                 .ok_or(NumericFault::Overflow("maint_sum"))?;
++            let unpaid = cost.saturating_sub(pay.maint);
++            probe.maint_due = probe
++                .maint_due
++                .checked_add(cost)
++                .ok_or(NumericFault::Overflow("maint_due"))?;
++            probe.maint_unpaid = probe
++                .maint_unpaid
++                .checked_add(unpaid)
++                .ok_or(NumericFault::Overflow("maint_unpaid"))?;
++            probe.debt_accrued = probe
++                .debt_accrued
++                .checked_add(unpaid)
++                .ok_or(NumericFault::Overflow("debt_acc"))?;
+             let unpaid_now = org.maintenance_debt > debt0;
+             maint_ok[i] = !unpaid_now && (pay.total() >= cost || cost == 0);
+             org.cognition_paid = false;
+@@ -286,6 +315,13 @@ impl World {
+         self.add_diss(maint_diss)?;
+ 
+         if decision {
++            for org in self.state.organisms.iter().filter(|o| !o.marked_dead) {
++                let _ = org;
++                probe.cognition_due = probe
++                    .cognition_due
++                    .checked_add(cog)
++                    .ok_or(NumericFault::Overflow("cog_due"))?;
++            }
+             for (i, org) in self.state.organisms.iter_mut().enumerate() {
+                 if org.marked_dead {
+                     continue;
+@@ -382,7 +418,10 @@ impl World {
+                                 0.0
+                             };
+                             self.last_obs.insert(id, frame.obs);
+-                            self.last_decisions.push(diag);
++                            self.probe_aggregate.push(&diag);
++                            if self.last_decisions.len() < self.probe_frame_limit {
++                                self.last_decisions.push(diag);
++                            }
+                         }
+                     }
+                 } else {
+@@ -400,16 +439,15 @@ impl World {
+             }
+         }
+ 
++        if decision {
++            self.apply_diagnostic_control();
++        }
+         if self.disable_active_motion {
+             for org in &mut self.state.organisms {
+-                zero_control(org);
++                zero_motion_only(org);
+             }
+         }
+ 
+-        if decision {
+-            self.apply_diagnostic_control();
+-        }
+-
+         self.maybe_fault(FaultPoint::AfterP2)?;
+ 
+         // P3: pay motion attempt.
+@@ -909,3 +947,85 @@ fn zero_control(org: &mut Organism) {
+     org.control.repair = false;
+     org.control.reproduce = false;
+ }
++
++/// `disable_active_motion` only clears locomotion, not metabolic flags.
++fn zero_motion_only(org: &mut Organism) {
++    org.control.thrust = 0;
++    org.control.turn = 0;
++    org.control.u_effective = 0.0;
++    org.control.w_effective = 0.0;
++}
++
++fn finite_brain(b: &universe_types::BrainState) -> bool {
++    b.a.iter().all(|r| r.iter().all(|x| x.is_finite()))
++        && b.v.iter().all(|x| x.is_finite())
++        && b.h.iter().all(|x| x.is_finite())
++        && b.e_a.iter().all(|r| r.iter().all(|x| x.is_finite()))
++        && b.e_v.iter().all(|x| x.is_finite())
++        && b.phi_prev.iter().all(|x| x.is_finite())
++        && b.grad_log.iter().all(|r| r.iter().all(|x| x.is_finite()))
++        && b.grad_ent.iter().all(|r| r.iter().all(|x| x.is_finite()))
++        && b.r.is_finite()
++        && b.gamma.is_finite()
++        && b.trace_decay.is_finite()
++        && b.last_delta.is_finite()
++}
++
++pub fn validate_loaded_world(spec: &RuleSpec, state: &WorldState) -> Result<(), SimError> {
++    let expect = rules_hash(spec)?;
++    if state.rules_hash != expect {
++        return Err(SimError::ExperimentSetup(
++            "loaded state.rules_hash does not match the provided RuleSpec".into(),
++        ));
++    }
++    let n = (spec.world.grid_width as usize)
++        .checked_mul(spec.world.grid_height as usize)
++        .ok_or_else(|| SimError::ExperimentSetup("grid overflow".into()))?;
++    if state.fields.width != spec.world.grid_width || state.fields.height != spec.world.grid_height
++    {
++        return Err(SimError::ExperimentSetup("field size does not match spec".into()));
++    }
++    if state.fields.n.len() != n
++        || state.fields.o.len() != n
++        || state.fields.s.len() != n
++        || state.fields.q.len() != n
++        || state.fields.s_remainder.len() != n
++        || state.fields.q_remainder.len() != n
++    {
++        return Err(SimError::ExperimentSetup("field array length mismatch".into()));
++    }
++    if !state.future_inputs.is_empty() {
++        return Err(SimError::ExperimentSetup(
++            "non-empty future_inputs are not executed and must not be silently ignored".into(),
++        ));
++    }
++    let mut ids = std::collections::BTreeSet::new();
++    let mut hashes = std::collections::BTreeSet::new();
++    for g in &state.genomes {
++        if !g.param_count_ok() {
++            return Err(SimError::ExperimentSetup("genome parameter count invalid".into()));
++        }
++        hashes.insert(g.hash);
++    }
++    for org in &state.organisms {
++        if !ids.insert(org.entity_id) {
++            return Err(SimError::ExperimentSetup("duplicate entity id".into()));
++        }
++        if !hashes.contains(&org.genome_hash) {
++            return Err(SimError::ExperimentSetup("organism genome hash missing".into()));
++        }
++        if !org.geom.x.is_finite() || !org.geom.y.is_finite() || !org.geom.theta.is_finite() {
++            return Err(SimError::ExperimentSetup("non-finite geometry".into()));
++        }
++        if !finite_brain(&org.brain) {
++            return Err(SimError::ExperimentSetup("non-finite brain state".into()));
++        }
++        if org.accounts.n > org.n_max
++            || org.accounts.c > org.c_max
++            || org.accounts.e_old.saturating_add(org.accounts.e_new) > org.e_max
++        {
++            return Err(SimError::ExperimentSetup("account exceeds capacity".into()));
++        }
++    }
++    Ok(())
++}
+diff --git a/crates/universe_lab/Cargo.toml b/crates/universe_lab/Cargo.toml
+index f423edf..f06d6c7 100644
+--- a/crates/universe_lab/Cargo.toml
++++ b/crates/universe_lab/Cargo.toml
+@@ -12,3 +12,5 @@ universe_core = { workspace = true }
+ universe_archive = { workspace = true }
+ narrator = { path = "../../apps/narrator" }
+ hex = { workspace = true }
++serde = { workspace = true }
++serde_yaml = { workspace = true }
+diff --git a/crates/universe_lab/src/d2.rs b/crates/universe_lab/src/d2.rs
+index 36c5466..5cc9d15 100644
+--- a/crates/universe_lab/src/d2.rs
++++ b/crates/universe_lab/src/d2.rs
+@@ -520,10 +520,32 @@ mod tests {
+         assert!(r.sample_frames.iter().any(|d| d.tick == 5 && d.obs[31] > 0.0));
+     }
+ 
++    #[test]
++    fn f02_runtime_pack_hash_includes_forced_params() {
++        let spec = reversal_spec();
++        let st = initialize_reversal_world(&spec, 3).unwrap();
++        let mk = |thrust, turn| {
++            let mut w = World::from_state(spec.clone(), st.clone());
++            w.control_mode = ControlMode::Forced { thrust, turn };
++            RuntimePack::from_world(&w)
++        };
++        let a = mk(1, 0);
++        let b = mk(-1, 0);
++        let c = mk(1, 1);
++        assert_ne!(a.content_hash(), b.content_hash());
++        assert_ne!(a.content_hash(), c.content_hash());
++        assert_eq!(a.content_hash(), RuntimePack::from_world(&a.clone().into_world()).content_hash());
++        let bad = World::from_state_checked(spec.clone(), {
++            let mut s = st.clone();
++            s.rules_hash = [0; 32];
++            s
++        });
++        assert!(bad.is_err());
++    }
++
+     #[test]
+     fn s0_restore_replays_without_periodic_snapshot() {
+         use universe_archive::Archive;
+-        use universe_core::init::initialize_reversal_world;
+         use universe_types::state_hash;
+         let spec = reversal_spec();
+         let dir = std::env::temp_dir().join(format!(
+diff --git a/crates/universe_lab/src/experiment.rs b/crates/universe_lab/src/experiment.rs
+index fba5451..8dccc1a 100644
+--- a/crates/universe_lab/src/experiment.rs
++++ b/crates/universe_lab/src/experiment.rs
+@@ -328,14 +328,26 @@ impl RuntimePack {
+         w
+     }
+ 
++    pub fn into_world_checked(self) -> Result<World, universe_types::SimError> {
++        let mut w = World::from_state_checked(self.spec, self.state)?;
++        w.apply_runtime(
++            self.freeze_learning,
++            self.disable_active_motion,
++            self.disable_reproduction,
++            self.control_mode,
++        );
++        Ok(w)
++    }
++
+     pub fn content_hash(&self) -> Hash32 {
+         let mut w = CanonWriter::new();
++        w.raw(b"RP01");
+         w.raw(&self.spec.encode_canonical().expect("spec"));
+         w.raw(&self.state.encode_canonical().expect("state"));
+         w.bool(self.freeze_learning);
+         w.bool(self.disable_reproduction);
+         w.bool(self.disable_active_motion);
+-        w.u8(self.control_mode.code());
++        self.control_mode.encode_canonical(&mut w);
+         sha256(&w.into_inner())
+     }
+ }
+@@ -357,6 +369,13 @@ pub fn close_light_keep_q(spec: &RuleSpec) -> LightingRules {
+     l
+ }
+ 
++/// Keep lamp geometry and existing Q; only stop new radiation.
++pub fn close_radiation_keep_geometry(spec: &RuleSpec) -> LightingRules {
++    let mut l = spec.lighting.clone();
++    l.radiation_input_per_cell = 0;
++    l
++}
++
+ pub fn state_fingerprint(state: &WorldState) -> String {
+     hex_hash(&state_hash(state).expect("state hash"))
+ }
+diff --git a/crates/universe_lab/src/lib.rs b/crates/universe_lab/src/lib.rs
+index 0bc4e82..809dda6 100644
+--- a/crates/universe_lab/src/lib.rs
++++ b/crates/universe_lab/src/lib.rs
+@@ -10,6 +10,9 @@ pub mod d1;
+ pub mod d2;
+ pub mod d2d;
+ pub mod experiment;
++pub mod checkpoint;
++pub mod f2;
++pub mod t_recover;
+ 
+ /// Chapter 42.4 readout reversal, one seed.
+ /// Returns last-5k correct-direction fraction and mean last-step fixture reward.
+@@ -65,7 +68,7 @@ pub fn readout_reversal_one_seed(seed: u64, freeze: bool) -> (f64, f64) {
+             reward_last += r_last;
+         }
+         if !freeze {
+-            apply_readout_update(&mut brain, &a0, &phi, &spec);
++            apply_readout_update(&mut brain, &a0, &phi, &spec).unwrap();
+         }
+         brain.phi_prev = phi;
+     }
+@@ -212,7 +215,7 @@ mod tests {
+             let hs = sample_policy_masked(&brain.a, &phi, 1, i, 1, true, true).unwrap();
+             store_grads(&mut brain, &phi, &hs, true);
+             brain.r = 0.02;
+-            apply_readout_update(&mut brain, &a0, &phi, &spec);
++            apply_readout_update(&mut brain, &a0, &phi, &spec).unwrap();
+             assert!(brain.a[0][0].is_finite());
+         }
+     }
+diff --git a/crates/universe_types/src/canon.rs b/crates/universe_types/src/canon.rs
+index 24263a1..a86de2b 100644
+--- a/crates/universe_types/src/canon.rs
++++ b/crates/universe_types/src/canon.rs
+@@ -66,6 +66,15 @@ impl CanonWriter {
+         self.buf.extend_from_slice(&v.to_le_bytes());
+     }
+ 
++    pub fn i128(&mut self, v: i128) {
++        self.buf.extend_from_slice(&v.to_le_bytes());
++    }
++
++    pub fn blob(&mut self, bytes: &[u8]) {
++        self.u64(bytes.len() as u64);
++        self.raw(bytes);
++    }
++
+     pub fn bytes32(&mut self, v: &[u8; 32]) {
+         self.buf.extend_from_slice(v);
+     }
+@@ -216,6 +225,16 @@ impl<'a> CanonReader<'a> {
+         Ok(u128::from_le_bytes(b.try_into().unwrap()))
+     }
+ 
++    pub fn i128(&mut self) -> Result<i128, NumericFault> {
++        let b = self.take(16)?;
++        Ok(i128::from_le_bytes(b.try_into().unwrap()))
++    }
++
++    pub fn blob(&mut self) -> Result<&'a [u8], NumericFault> {
++        let n = self.u64()? as usize;
++        self.take(n)
++    }
++
+     pub fn bytes32(&mut self) -> Result<[u8; 32], NumericFault> {
+         let b = self.take(32)?;
+         let mut a = [0u8; 32];
+@@ -239,6 +258,10 @@ impl<'a> CanonReader<'a> {
+         self.buf.len().saturating_sub(self.pos)
+     }
+ 
++    pub fn raw(&mut self, n: usize) -> Result<&'a [u8], NumericFault> {
++        self.take(n)
++    }
++
+     pub fn finish(self) -> Result<(), NumericFault> {
+         if self.pos != self.buf.len() {
+             return Err(NumericFault::Overflow("trailing_bytes"));
+diff --git a/crates/universe_types/src/lib.rs b/crates/universe_types/src/lib.rs
+index d1aa87d..8b8c9ce 100644
+--- a/crates/universe_types/src/lib.rs
++++ b/crates/universe_types/src/lib.rs
+@@ -15,9 +15,9 @@ pub use error::{ActionFailure, ConfigError, NumericFault, SimError};
+ pub use events::{LifeEvent, LifeEventKind};
+ pub use hash::{diff_states, hex_hash, rules_hash, sha256, state_hash, Hash32};
+ pub use rules::{
+-    parse_rule_yaml, ArchiveRules, BrainRules, EvolutionRules, ExperimentSpec, InitRules,
+-    LightingRules, MemoryRules, PhysicsRules, PhysiologyRules, PresentationSpec, RateRules,
+-    ReactionRules, RuleSpec, SafetyRules, TimeRules, WorldRules,
++    parse_lab_yaml, parse_rule_yaml, ArchiveRules, BrainRules, EvolutionRules, ExperimentSpec,
++    InitRules, LightingRules, MemoryRules, PhysicsRules, PhysiologyRules, PresentationSpec,
++    RateRules, ReactionRules, RuleSpec, SafetyRules, TimeRules, WorldRules,
+ };
+ pub use state::*;
+ pub use units::*;
+diff --git a/crates/universe_types/src/rules.rs b/crates/universe_types/src/rules.rs
+index 8dacd74..b5ac1e3 100644
+--- a/crates/universe_types/src/rules.rs
++++ b/crates/universe_types/src/rules.rs
+@@ -567,6 +567,54 @@ impl RuleSpec {
+                 "EU-Core-1 social/adhere capabilities must be off".into(),
+             ));
+         }
++        if self.world.q_loss_divisor == 0
++            || self.world.s_decay_divisor == 0
++            || self.world.n_divisor == 0
++            || self.world.o_divisor == 0
++            || self.world.s_divisor == 0
++            || self.world.q_divisor == 0
++        {
++            return Err(ConfigError::IllegalCombination(
++                "field divisors must be non-zero".into(),
++            ));
++        }
++        if self.world.q_loss_divisor > u64::from(u16::MAX)
++            || self.world.s_decay_divisor > u64::from(u16::MAX)
++        {
++            return Err(ConfigError::IllegalCombination(
++                "decay divisor exceeds u16 remainder range".into(),
++            ));
++        }
++        if self.physics.substeps == 0 {
++            return Err(ConfigError::IllegalCombination("substeps must be > 0".into()));
++        }
++        if (self.physics.max_angular_speed - std::f64::consts::PI).abs() > 1e-15 {
++            return Err(ConfigError::IllegalCombination(
++                "max_angular_speed must be 蟺".into(),
++            ));
++        }
++        if (self.brain.leak_old - 0.75).abs() > 0.0 || (self.brain.leak_new - 0.25).abs() > 0.0 {
++            return Err(ConfigError::IllegalCombination(
++                "leak_old/leak_new changes are not supported by this executor".into(),
++            ));
++        }
++        if (self.brain.sense_range_lu - 4.0).abs() > 0.0 {
++            return Err(ConfigError::IllegalCombination(
++                "sense_range_lu changes are not supported by this executor".into(),
++            ));
++        }
++        if (self.brain.w_rec_l1 - 0.9).abs() > 0.0 {
++            return Err(ConfigError::IllegalCombination(
++                "w_rec_l1 changes are not supported by this executor".into(),
++            ));
++        }
++        if !self.physics.radius_lu.is_finite()
++            || !self.physics.max_linear_speed.is_finite()
++            || !self.world.width_lu.is_finite()
++            || !self.world.height_lu.is_finite()
++        {
++            return Err(ConfigError::IllegalCombination("non-finite geometry".into()));
++        }
+         Ok(())
+     }
+ 
+@@ -782,6 +830,14 @@ pub fn parse_rule_yaml(text: &str) -> Result<RuleSpec, ConfigError> {
+     Ok(spec)
+ }
+ 
++/// Lab maps (16脳16 etc.) must not go through `validate()`'s 128脳128 map check.
++pub fn parse_lab_yaml(text: &str) -> Result<RuleSpec, ConfigError> {
++    let spec: RuleSpec = serde_yaml::from_str(text)
++        .map_err(|e| ConfigError::UnknownOrMalformed(e.to_string()))?;
++    spec.validate_lab()?;
++    Ok(spec)
++}
++
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct ExperimentSpec {

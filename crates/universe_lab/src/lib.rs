@@ -10,6 +10,9 @@ pub mod d1;
 pub mod d2;
 pub mod d2d;
 pub mod experiment;
+pub mod checkpoint;
+pub mod f2;
+pub mod t_recover;
 
 /// Chapter 42.4 readout reversal, one seed.
 /// Returns last-5k correct-direction fraction and mean last-step fixture reward.
@@ -65,7 +68,7 @@ pub fn readout_reversal_one_seed(seed: u64, freeze: bool) -> (f64, f64) {
             reward_last += r_last;
         }
         if !freeze {
-            apply_readout_update(&mut brain, &a0, &phi, &spec);
+            apply_readout_update(&mut brain, &a0, &phi, &spec).unwrap();
         }
         brain.phi_prev = phi;
     }
@@ -212,7 +215,7 @@ mod tests {
             let hs = sample_policy_masked(&brain.a, &phi, 1, i, 1, true, true).unwrap();
             store_grads(&mut brain, &phi, &hs, true);
             brain.r = 0.02;
-            apply_readout_update(&mut brain, &a0, &phi, &spec);
+            apply_readout_update(&mut brain, &a0, &phi, &spec).unwrap();
             assert!(brain.a[0][0].is_finite());
         }
     }

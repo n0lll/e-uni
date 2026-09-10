@@ -1,0 +1,13 @@
+seed,restricted_freeze,restricted_learn,diff,learn_status,freeze_status
+10001,4000,4000,0,Died,NotRecoveredByH
+10002,4000,4000,0,Died,Died
+10003,4000,4000,0,Died,Died
+10004,4000,3036,964,Recovered,Died
+10005,3430,4000,-570,Died,Recovered
+10006,4000,4000,0,Died,Died
+10007,3631,4000,-369,Died,Recovered
+10008,4000,4000,0,Died,Died
+10009,4000,4000,0,Died,Died
+10010,4000,4000,0,Died,Died
+10011,4000,4000,0,Died,Died
+10012,4000,4000,0,Died,Died

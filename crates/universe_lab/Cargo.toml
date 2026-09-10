@@ -12,3 +12,5 @@ universe_core = { workspace = true }
 universe_archive = { workspace = true }
 narrator = { path = "../../apps/narrator" }
 hex = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }

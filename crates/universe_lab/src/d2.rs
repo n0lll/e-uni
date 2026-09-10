@@ -521,9 +521,31 @@ mod tests {
     }
 
     #[test]
+    fn f02_runtime_pack_hash_includes_forced_params() {
+        let spec = reversal_spec();
+        let st = initialize_reversal_world(&spec, 3).unwrap();
+        let mk = |thrust, turn| {
+            let mut w = World::from_state(spec.clone(), st.clone());
+            w.control_mode = ControlMode::Forced { thrust, turn };
+            RuntimePack::from_world(&w)
+        };
+        let a = mk(1, 0);
+        let b = mk(-1, 0);
+        let c = mk(1, 1);
+        assert_ne!(a.content_hash(), b.content_hash());
+        assert_ne!(a.content_hash(), c.content_hash());
+        assert_eq!(a.content_hash(), RuntimePack::from_world(&a.clone().into_world()).content_hash());
+        let bad = World::from_state_checked(spec.clone(), {
+            let mut s = st.clone();
+            s.rules_hash = [0; 32];
+            s
+        });
+        assert!(bad.is_err());
+    }
+
+    #[test]
     fn s0_restore_replays_without_periodic_snapshot() {
         use universe_archive::Archive;
-        use universe_core::init::initialize_reversal_world;
         use universe_types::state_hash;
         let spec = reversal_spec();
         let dir = std::env::temp_dir().join(format!(

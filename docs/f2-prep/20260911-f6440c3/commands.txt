@@ -1,0 +1,5 @@
+cargo test --offline --workspace --exclude observer --exclude narrator
+cargo run --release --offline -p universe_lab --bin f2 -- generate docs/f2-prep/20260911-f6440c3
+cargo run --release --offline -p universe_lab --bin f2 -- validate docs/f2-prep/20260911-f6440c3
+cargo run --release --offline -p universe_lab --bin f2 -- dev docs/f2-prep/20260911-f6440c3
+cargo run --release --offline -p universe_lab --bin f2 -- recompute docs/f2-prep/20260911-f6440c3

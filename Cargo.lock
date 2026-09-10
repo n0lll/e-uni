@@ -394,6 +394,8 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "narrator",
+ "serde",
+ "serde_yaml",
  "universe_archive",
  "universe_core",
  "universe_types",

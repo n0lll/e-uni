@@ -328,14 +328,26 @@ impl RuntimePack {
         w
     }
 
+    pub fn into_world_checked(self) -> Result<World, universe_types::SimError> {
+        let mut w = World::from_state_checked(self.spec, self.state)?;
+        w.apply_runtime(
+            self.freeze_learning,
+            self.disable_active_motion,
+            self.disable_reproduction,
+            self.control_mode,
+        );
+        Ok(w)
+    }
+
     pub fn content_hash(&self) -> Hash32 {
         let mut w = CanonWriter::new();
+        w.raw(b"RP01");
         w.raw(&self.spec.encode_canonical().expect("spec"));
         w.raw(&self.state.encode_canonical().expect("state"));
         w.bool(self.freeze_learning);
         w.bool(self.disable_reproduction);
         w.bool(self.disable_active_motion);
-        w.u8(self.control_mode.code());
+        self.control_mode.encode_canonical(&mut w);
         sha256(&w.into_inner())
     }
 }
@@ -353,6 +365,13 @@ pub fn close_light_keep_q(spec: &RuleSpec) -> LightingRules {
     let mut l = spec.lighting.clone();
     l.y0 = 1;
     l.y1 = 0;
+    l.radiation_input_per_cell = 0;
+    l
+}
+
+/// Keep lamp geometry and existing Q; only stop new radiation.
+pub fn close_radiation_keep_geometry(spec: &RuleSpec) -> LightingRules {
+    let mut l = spec.lighting.clone();
     l.radiation_input_per_cell = 0;
     l
 }

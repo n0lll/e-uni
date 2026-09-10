@@ -38,7 +38,23 @@ pub fn recurrent_features(
     (h_next, phi)
 }
 
-fn logits(a: &[[f64; PHI]; POLICY_LOGITS], phi: &[f64; PHI]) -> [f64; POLICY_LOGITS] {
+fn require_finite(x: f64, _tag: &'static str) -> Result<(), NumericFault> {
+    if x.is_finite() {
+        Ok(())
+    } else {
+        Err(NumericFault::NonFinite)
+    }
+}
+
+fn logits(a: &[[f64; PHI]; POLICY_LOGITS], phi: &[f64; PHI]) -> Result<[f64; POLICY_LOGITS], NumericFault> {
+    for row in a {
+        for &v in row {
+            require_finite(v, "A")?;
+        }
+    }
+    for &v in phi {
+        require_finite(v, "phi")?;
+    }
     let mut y = [0.0; POLICY_LOGITS];
     for i in 0..POLICY_LOGITS {
         let mut s = 0.0;
@@ -47,7 +63,7 @@ fn logits(a: &[[f64; PHI]; POLICY_LOGITS], phi: &[f64; PHI]) -> [f64; POLICY_LOG
         }
         y[i] = s;
     }
-    y
+    Ok(y)
 }
 
 pub fn value(v: &[f64; PHI], phi: &[f64; PHI]) -> f64 {
@@ -65,6 +81,21 @@ fn softmax3(z: [f64; 3]) -> [f64; 3] {
     let e2 = libm::exp(z[2] - m);
     let s = e0 + e1 + e2;
     [e0 / s, e1 / s, e2 / s]
+}
+
+/// Legal class masks may be −∞. NaN or +∞ in a participating logit is a fault.
+fn softmax3_checked(z: [f64; 3]) -> Result<[f64; 3], NumericFault> {
+    if z.iter().any(|x| x.is_nan() || *x == f64::INFINITY) {
+        return Err(NumericFault::NonFinite);
+    }
+    if !z.iter().any(|x| x.is_finite()) {
+        return Err(NumericFault::NonFinite);
+    }
+    let p = softmax3(z);
+    if p.iter().any(|x| !x.is_finite()) {
+        return Err(NumericFault::NonFinite);
+    }
+    Ok(p)
 }
 
 fn sigmoid(z: f64) -> f64 {
@@ -200,13 +231,19 @@ pub fn sample_policy_masked(
     allow_repro: bool,
     mask_idle_thrust: bool,
 ) -> Result<HeadSample, NumericFault> {
-    let mut z = logits(a, phi);
+    let mut z = logits(a, phi)?;
+    for (i, &zi) in z.iter().enumerate() {
+        let legally_masked = i >= 12 || (i == 11 && !allow_repro) || (i == 1 && mask_idle_thrust);
+        if !legally_masked && !zi.is_finite() {
+            return Err(NumericFault::NonFinite);
+        }
+    }
     mask_policy(&mut z, allow_repro);
     if mask_idle_thrust {
         z[1] = f64::NEG_INFINITY;
     }
-    let p_thr = softmax3([z[0], z[1], z[2]]);
-    let p_turn = softmax3([z[3], z[4], z[5]]);
+    let p_thr = softmax3_checked([z[0], z[1], z[2]])?;
+    let p_turn = softmax3_checked([z[3], z[4], z[5]])?;
     let u0 = random_unit(root_seed, RngDomain::PolicySample.code(), tick, entity, 0, 0)?;
     let u1 = random_unit(root_seed, RngDomain::PolicySample.code(), tick, entity, 0, 1)?;
     let a_thr = sample_cat3(p_thr, u0);
@@ -214,13 +251,8 @@ pub fn sample_policy_masked(
     let mut binary = [false; 10];
     let mut p_bin = [0.0; 10];
     for h in 0..10 {
-        let p = if z[6 + h].is_finite() {
-            sigmoid(z[6 + h])
-        } else {
-            0.0
-        };
-        p_bin[h] = p;
-        // still consume RNG slots for masked heads: j = 2+h because thrust/turn used j=0,1
+        let logit_i = 6 + h;
+        let legally_masked = h >= 6 || (h == 5 && !allow_repro);
         let u = random_unit(
             root_seed,
             RngDomain::PolicySample.code(),
@@ -229,7 +261,20 @@ pub fn sample_policy_masked(
             0,
             2 + h as u64,
         )?;
-        binary[h] = z[6 + h].is_finite() && u < p;
+        if legally_masked {
+            p_bin[h] = 0.0;
+            binary[h] = false;
+            continue;
+        }
+        if !z[logit_i].is_finite() {
+            return Err(NumericFault::NonFinite);
+        }
+        let p = sigmoid(z[logit_i]);
+        if !p.is_finite() {
+            return Err(NumericFault::NonFinite);
+        }
+        p_bin[h] = p;
+        binary[h] = u < p;
     }
     Ok(HeadSample {
         thrust: a_thr as i8 - 1,
@@ -292,6 +337,16 @@ pub struct UpdateStats {
     pub clipped: bool,
     pub v_prev: f64,
     pub v_next: f64,
+    /// ‖actor_lr · δ_used · e_A‖_F after traces, coefficients included.
+    pub actor_task_gradient_norm: Option<f64>,
+    /// ‖actor_lr · entropy_coef · ∇H‖_F
+    pub entropy_term_norm: Option<f64>,
+    /// ‖actor_lr · baseline_coef · (A−A0)‖_F
+    pub baseline_term_norm: Option<f64>,
+    pub trace_norm_before_projection: Option<f64>,
+    pub trace_norm_after_projection: Option<f64>,
+    pub update_norm_before_projection: Option<f64>,
+    pub update_norm_after_projection: Option<f64>,
 }
 
 pub fn apply_readout_update(
@@ -299,54 +354,82 @@ pub fn apply_readout_update(
     a0: &[[f64; PHI]; POLICY_LOGITS],
     phi_next: &[f64; PHI],
     spec: &RuleSpec,
-) -> UpdateStats {
+) -> Result<UpdateStats, NumericFault> {
+    for &x in phi_next {
+        require_finite(x, "phi_next")?;
+    }
     let v_prev = value(&brain.v, &brain.phi_prev);
     let v_next = value(&brain.v, phi_next);
+    require_finite(v_prev, "v_prev")?;
+    require_finite(v_next, "v_next")?;
+    require_finite(brain.r, "R")?;
+    require_finite(brain.gamma, "gamma")?;
     let delta = brain.r + brain.gamma * v_next - v_prev;
+    require_finite(delta, "delta")?;
     brain.last_delta = delta;
     let du = delta.clamp(-spec.brain.delta_clip, spec.brain.delta_clip);
-    // traces
     for i in 0..POLICY_LOGITS {
         for j in 0..PHI {
             brain.e_a[i][j] = brain.trace_decay * brain.e_a[i][j] + brain.grad_log[i][j];
+            require_finite(brain.e_a[i][j], "e_a")?;
         }
     }
     for j in 0..PHI {
         brain.e_v[j] = brain.trace_decay * brain.e_v[j] + brain.phi_prev[j];
+        require_finite(brain.e_v[j], "e_v")?;
     }
+    let trace_before = frobenius(&brain.e_a);
     project_frob(&mut brain.e_a, spec.brain.e_a_radius);
     project_l2(&mut brain.e_v, spec.brain.e_v_radius);
+    let trace_after = frobenius(&brain.e_a);
+    let mut task = [[0.0; PHI]; POLICY_LOGITS];
+    let mut ent = [[0.0; PHI]; POLICY_LOGITS];
+    let mut base = [[0.0; PHI]; POLICY_LOGITS];
     let mut da = [[0.0; PHI]; POLICY_LOGITS];
     for i in 0..POLICY_LOGITS {
         for j in 0..PHI {
-            da[i][j] = spec.brain.actor_lr
-                * (du * brain.e_a[i][j] + spec.brain.entropy_coef * brain.grad_ent[i][j]
-                    - spec.brain.baseline_coef * (brain.a[i][j] - a0[i][j]));
+            task[i][j] = spec.brain.actor_lr * du * brain.e_a[i][j];
+            ent[i][j] = spec.brain.actor_lr * spec.brain.entropy_coef * brain.grad_ent[i][j];
+            base[i][j] = spec.brain.actor_lr * spec.brain.baseline_coef * (brain.a[i][j] - a0[i][j]);
+            da[i][j] = task[i][j] + ent[i][j] - base[i][j];
+            require_finite(da[i][j], "da")?;
         }
     }
     let mut dv = [0.0; PHI];
     for j in 0..PHI {
         dv[j] = spec.brain.critic_lr * du * brain.e_v[j];
+        require_finite(dv[j], "dv")?;
     }
+    let update_before = frobenius(&da);
     project_frob(&mut da, spec.brain.d_a_radius);
     project_l2(&mut dv, spec.brain.d_v_radius);
+    let update_after = frobenius(&da);
     for i in 0..POLICY_LOGITS {
         for j in 0..PHI {
             brain.a[i][j] += da[i][j];
+            require_finite(brain.a[i][j], "A")?;
         }
     }
     for j in 0..PHI {
         brain.v[j] += dv[j];
+        require_finite(brain.v[j], "v")?;
     }
     project_rows(&mut brain.a, spec.brain.a_row_radius);
     project_l2(&mut brain.v, spec.brain.v_radius);
-    UpdateStats {
+    Ok(UpdateStats {
         delta,
         delta_used: du,
         clipped: delta.abs() > spec.brain.delta_clip && delta.is_finite(),
         v_prev,
         v_next,
-    }
+        actor_task_gradient_norm: Some(frobenius(&task)),
+        entropy_term_norm: Some(frobenius(&ent)),
+        baseline_term_norm: Some(frobenius(&base)),
+        trace_norm_before_projection: Some(trace_before),
+        trace_norm_after_projection: Some(trace_after),
+        update_norm_before_projection: Some(update_before),
+        update_norm_after_projection: Some(update_after),
+    })
 }
 
 pub fn tick_reward(org: &Organism, spec: &RuleSpec, births: u64, died: bool) -> f64 {
@@ -395,8 +478,14 @@ pub fn decide(
     let a_before = org.brain.a;
     let applied = org.brain.has_pending && !freeze;
     let (h_next, phi_next) = recurrent_features(obs, &org.brain.h, &w_in, &w_rec, &b_h);
+    for &x in obs {
+        require_finite(x, "obs")?;
+    }
+    for &x in &h_next {
+        require_finite(x, "h")?;
+    }
     let stats = if applied {
-        apply_readout_update(&mut org.brain, &a0, &phi_next, spec)
+        apply_readout_update(&mut org.brain, &a0, &phi_next, spec)?
     } else {
         UpdateStats::default()
     };
@@ -492,6 +581,13 @@ pub fn decide(
         h_before,
         h_after: h_next,
         phi: phi_next,
+        actor_task_gradient_norm: stats.actor_task_gradient_norm,
+        entropy_term_norm: stats.entropy_term_norm,
+        baseline_term_norm: stats.baseline_term_norm,
+        trace_norm_before_projection: stats.trace_norm_before_projection,
+        trace_norm_after_projection: stats.trace_norm_after_projection,
+        update_norm_before_projection: stats.update_norm_before_projection,
+        update_norm_after_projection: stats.update_norm_after_projection,
         ..crate::probe::DecisionDiag::default()
     })
 }

@@ -27,9 +27,10 @@ pub use physiology::{
     scale_control, scale_control_parts, MaintPay, MotionPay,
 };
 pub use probe::{
-    aggregate_decisions, budget_p, ControlMode, DecisionAggregate, DecisionDiag, DecisionSkip,
-    FaultPoint, ObservationFrame, RunLedger, TickProbe,
+    aggregate_decisions, budget_p, budget_p_i128, ControlMode, DecisionAggregate, DecisionDiag,
+    DecisionSkip, FaultPoint, ObservationFrame, RunLedger, TickProbe,
 };
+pub use world::{validate_loaded_world, World};
 pub use ledger::{
     catabolism, commit_e_new_into_old, n_uptake, o_uptake, photosynth, repair, spend_old_energy,
     transfer_c, BodyView, CellView,
@@ -39,7 +40,6 @@ pub use rng::{
     encode_key_counter, geometry_draw_index, philox4x32_10, quota_draw_index, random_range,
     random_u32, random_u32_domain, random_unit, ObserverRng,
 };
-pub use world::World;
 
 
 #[cfg(test)]
@@ -455,7 +455,7 @@ mod g3_tests {
             p
         };
         let p_before = 1.0 / (1.0 + libm::exp(-brain.a[6][0]));
-        apply_readout_update(&mut brain, &a0, &phi_next, &spec);
+        apply_readout_update(&mut brain, &a0, &phi_next, &spec).unwrap();
         let p_after = 1.0 / (1.0 + libm::exp(-brain.a[6][0]));
         assert!(p_after > p_before);
     }
@@ -493,7 +493,7 @@ mod g3_tests {
             p[0] = 1.0;
             p
         };
-        apply_readout_update(&mut st.organisms[0].brain, &a0, &phi, &spec);
+        apply_readout_update(&mut st.organisms[0].brain, &a0, &phi, &spec).unwrap();
         assert_ne!(st.organisms[0].brain.a[0][0].to_bits(), a0[0][0].to_bits());
         assert_eq!(st.organisms[1].brain.as_ref(), b_before.as_ref());
     }

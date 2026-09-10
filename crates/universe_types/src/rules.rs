@@ -567,6 +567,54 @@ impl RuleSpec {
                 "EU-Core-1 social/adhere capabilities must be off".into(),
             ));
         }
+        if self.world.q_loss_divisor == 0
+            || self.world.s_decay_divisor == 0
+            || self.world.n_divisor == 0
+            || self.world.o_divisor == 0
+            || self.world.s_divisor == 0
+            || self.world.q_divisor == 0
+        {
+            return Err(ConfigError::IllegalCombination(
+                "field divisors must be non-zero".into(),
+            ));
+        }
+        if self.world.q_loss_divisor > u64::from(u16::MAX)
+            || self.world.s_decay_divisor > u64::from(u16::MAX)
+        {
+            return Err(ConfigError::IllegalCombination(
+                "decay divisor exceeds u16 remainder range".into(),
+            ));
+        }
+        if self.physics.substeps == 0 {
+            return Err(ConfigError::IllegalCombination("substeps must be > 0".into()));
+        }
+        if (self.physics.max_angular_speed - std::f64::consts::PI).abs() > 1e-15 {
+            return Err(ConfigError::IllegalCombination(
+                "max_angular_speed must be π".into(),
+            ));
+        }
+        if (self.brain.leak_old - 0.75).abs() > 0.0 || (self.brain.leak_new - 0.25).abs() > 0.0 {
+            return Err(ConfigError::IllegalCombination(
+                "leak_old/leak_new changes are not supported by this executor".into(),
+            ));
+        }
+        if (self.brain.sense_range_lu - 4.0).abs() > 0.0 {
+            return Err(ConfigError::IllegalCombination(
+                "sense_range_lu changes are not supported by this executor".into(),
+            ));
+        }
+        if (self.brain.w_rec_l1 - 0.9).abs() > 0.0 {
+            return Err(ConfigError::IllegalCombination(
+                "w_rec_l1 changes are not supported by this executor".into(),
+            ));
+        }
+        if !self.physics.radius_lu.is_finite()
+            || !self.physics.max_linear_speed.is_finite()
+            || !self.world.width_lu.is_finite()
+            || !self.world.height_lu.is_finite()
+        {
+            return Err(ConfigError::IllegalCombination("non-finite geometry".into()));
+        }
         Ok(())
     }
 
@@ -779,6 +827,14 @@ pub fn parse_rule_yaml(text: &str) -> Result<RuleSpec, ConfigError> {
     let spec: RuleSpec = serde_yaml::from_str(text)
         .map_err(|e| ConfigError::UnknownOrMalformed(e.to_string()))?;
     spec.validate()?;
+    Ok(spec)
+}
+
+/// Lab maps (16×16 etc.) must not go through `validate()`'s 128×128 map check.
+pub fn parse_lab_yaml(text: &str) -> Result<RuleSpec, ConfigError> {
+    let spec: RuleSpec = serde_yaml::from_str(text)
+        .map_err(|e| ConfigError::UnknownOrMalformed(e.to_string()))?;
+    spec.validate_lab()?;
     Ok(spec)
 }
 

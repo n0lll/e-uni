@@ -15,9 +15,9 @@ pub use error::{ActionFailure, ConfigError, NumericFault, SimError};
 pub use events::{LifeEvent, LifeEventKind};
 pub use hash::{diff_states, hex_hash, rules_hash, sha256, state_hash, Hash32};
 pub use rules::{
-    parse_rule_yaml, ArchiveRules, BrainRules, EvolutionRules, ExperimentSpec, InitRules,
-    LightingRules, MemoryRules, PhysicsRules, PhysiologyRules, PresentationSpec, RateRules,
-    ReactionRules, RuleSpec, SafetyRules, TimeRules, WorldRules,
+    parse_lab_yaml, parse_rule_yaml, ArchiveRules, BrainRules, EvolutionRules, ExperimentSpec,
+    InitRules, LightingRules, MemoryRules, PhysicsRules, PhysiologyRules, PresentationSpec,
+    RateRules, ReactionRules, RuleSpec, SafetyRules, TimeRules, WorldRules,
 };
 pub use state::*;
 pub use units::*;

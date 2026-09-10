@@ -1,0 +1,9 @@
+{
+  "n_pairs": 12,
+  "mean": 2.0833333333333335,
+  "lo": -173.25,
+  "hi": 241,
+  "stat_seed": 20260911,
+  "draws": 2000,
+  "quantile": "means[(0.025*draws) as usize] .. min((0.975*draws) as usize, draws-1)"
+}

@@ -66,6 +66,15 @@ impl CanonWriter {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
+    pub fn i128(&mut self, v: i128) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    pub fn blob(&mut self, bytes: &[u8]) {
+        self.u64(bytes.len() as u64);
+        self.raw(bytes);
+    }
+
     pub fn bytes32(&mut self, v: &[u8; 32]) {
         self.buf.extend_from_slice(v);
     }
@@ -216,6 +225,16 @@ impl<'a> CanonReader<'a> {
         Ok(u128::from_le_bytes(b.try_into().unwrap()))
     }
 
+    pub fn i128(&mut self) -> Result<i128, NumericFault> {
+        let b = self.take(16)?;
+        Ok(i128::from_le_bytes(b.try_into().unwrap()))
+    }
+
+    pub fn blob(&mut self) -> Result<&'a [u8], NumericFault> {
+        let n = self.u64()? as usize;
+        self.take(n)
+    }
+
     pub fn bytes32(&mut self) -> Result<[u8; 32], NumericFault> {
         let b = self.take(32)?;
         let mut a = [0u8; 32];
@@ -237,6 +256,10 @@ impl<'a> CanonReader<'a> {
 
     pub fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
+    }
+
+    pub fn raw(&mut self, n: usize) -> Result<&'a [u8], NumericFault> {
+        self.take(n)
     }
 
     pub fn finish(self) -> Result<(), NumericFault> {

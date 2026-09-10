@@ -1,0 +1,11 @@
+﻿cargo test --offline --workspace --exclude observer --exclude narrator
+  exit 0 (this machine, after F2-prep code changes)
+
+cargo run --release --offline -p universe_lab --bin f2 -- dev docs/f2-prep/20260911-f6440c3
+  exit 0; ~89s; C3=12/12 C4=12/12 neg_fp=0 residual=0 learn=1 freeze=2
+
+cargo run --release --offline -p universe_lab --bin f2 -- recompute docs/f2-prep/20260911-f6440c3
+  exit 0; files=72 errors=0
+
+cargo run --release --offline -p universe_lab --bin d2d -- docs/f2-prep/20260911-f6440c3/c5-regression
+  exit 0; valid_complete=true rows=40; mean=57818.0 matches D2-D

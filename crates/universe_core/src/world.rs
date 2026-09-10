@@ -42,7 +42,11 @@ pub struct World {
     pub last_skips: Vec<DecisionSkip>,
     pub last_observation: std::collections::HashMap<u64, ObservationFrame>,
     last_obs: std::collections::HashMap<u64, [f64; INPUTS]>,
+    pub probe_frame_limit: usize,
+    pub probe_aggregate: crate::probe::DecisionAggregate,
 }
+
+pub const DEFAULT_PROBE_FRAME_LIMIT: usize = 256;
 
 impl World {
     pub fn from_state(spec: RuleSpec, state: WorldState) -> Self {
@@ -64,7 +68,17 @@ impl World {
             last_skips: Vec::new(),
             last_observation: std::collections::HashMap::new(),
             last_obs: std::collections::HashMap::new(),
+            probe_frame_limit: DEFAULT_PROBE_FRAME_LIMIT,
+            probe_aggregate: crate::probe::DecisionAggregate::default(),
         }
+    }
+
+    /// Validated constructor for F2 load/restore. `from_state` remains an
+    /// internal entry without these checks.
+    pub fn from_state_checked(spec: RuleSpec, state: WorldState) -> Result<Self, SimError> {
+        spec.validate_lab()?;
+        validate_loaded_world(&spec, &state)?;
+        Ok(Self::from_state(spec, state))
     }
 
     pub fn apply_runtime(
@@ -107,6 +121,7 @@ impl World {
         let skips = self.last_skips.clone();
         let frames = self.last_observation.clone();
         let obs = self.last_obs.clone();
+        let probe_agg = self.probe_aggregate.clone();
         let metab_diss = self.last_metab_diss;
         let metab_e = self.last_metab_e_new;
         match self.step_apply() {
@@ -120,6 +135,7 @@ impl World {
                 self.last_skips = skips;
                 self.last_observation = frames;
                 self.last_obs = obs;
+                self.probe_aggregate = probe_agg;
                 self.last_metab_diss = metab_diss;
                 self.last_metab_e_new = metab_e;
                 if matches!(&e, SimError::Numeric(NumericFault::Overflow("contact_pairs"))) {
@@ -279,6 +295,19 @@ impl World {
             maint_diss = maint_diss
                 .checked_add(pay.total())
                 .ok_or(NumericFault::Overflow("maint_sum"))?;
+            let unpaid = cost.saturating_sub(pay.maint);
+            probe.maint_due = probe
+                .maint_due
+                .checked_add(cost)
+                .ok_or(NumericFault::Overflow("maint_due"))?;
+            probe.maint_unpaid = probe
+                .maint_unpaid
+                .checked_add(unpaid)
+                .ok_or(NumericFault::Overflow("maint_unpaid"))?;
+            probe.debt_accrued = probe
+                .debt_accrued
+                .checked_add(unpaid)
+                .ok_or(NumericFault::Overflow("debt_acc"))?;
             let unpaid_now = org.maintenance_debt > debt0;
             maint_ok[i] = !unpaid_now && (pay.total() >= cost || cost == 0);
             org.cognition_paid = false;
@@ -286,6 +315,13 @@ impl World {
         self.add_diss(maint_diss)?;
 
         if decision {
+            for org in self.state.organisms.iter().filter(|o| !o.marked_dead) {
+                let _ = org;
+                probe.cognition_due = probe
+                    .cognition_due
+                    .checked_add(cog)
+                    .ok_or(NumericFault::Overflow("cog_due"))?;
+            }
             for (i, org) in self.state.organisms.iter_mut().enumerate() {
                 if org.marked_dead {
                     continue;
@@ -382,7 +418,10 @@ impl World {
                                 0.0
                             };
                             self.last_obs.insert(id, frame.obs);
-                            self.last_decisions.push(diag);
+                            self.probe_aggregate.push(&diag);
+                            if self.last_decisions.len() < self.probe_frame_limit {
+                                self.last_decisions.push(diag);
+                            }
                         }
                     }
                 } else {
@@ -400,14 +439,13 @@ impl World {
             }
         }
 
-        if self.disable_active_motion {
-            for org in &mut self.state.organisms {
-                zero_control(org);
-            }
-        }
-
         if decision {
             self.apply_diagnostic_control();
+        }
+        if self.disable_active_motion {
+            for org in &mut self.state.organisms {
+                zero_motion_only(org);
+            }
         }
 
         self.maybe_fault(FaultPoint::AfterP2)?;
@@ -908,4 +946,86 @@ fn zero_control(org: &mut Organism) {
     org.control.metab_boost = false;
     org.control.repair = false;
     org.control.reproduce = false;
+}
+
+/// `disable_active_motion` only clears locomotion, not metabolic flags.
+fn zero_motion_only(org: &mut Organism) {
+    org.control.thrust = 0;
+    org.control.turn = 0;
+    org.control.u_effective = 0.0;
+    org.control.w_effective = 0.0;
+}
+
+fn finite_brain(b: &universe_types::BrainState) -> bool {
+    b.a.iter().all(|r| r.iter().all(|x| x.is_finite()))
+        && b.v.iter().all(|x| x.is_finite())
+        && b.h.iter().all(|x| x.is_finite())
+        && b.e_a.iter().all(|r| r.iter().all(|x| x.is_finite()))
+        && b.e_v.iter().all(|x| x.is_finite())
+        && b.phi_prev.iter().all(|x| x.is_finite())
+        && b.grad_log.iter().all(|r| r.iter().all(|x| x.is_finite()))
+        && b.grad_ent.iter().all(|r| r.iter().all(|x| x.is_finite()))
+        && b.r.is_finite()
+        && b.gamma.is_finite()
+        && b.trace_decay.is_finite()
+        && b.last_delta.is_finite()
+}
+
+pub fn validate_loaded_world(spec: &RuleSpec, state: &WorldState) -> Result<(), SimError> {
+    let expect = rules_hash(spec)?;
+    if state.rules_hash != expect {
+        return Err(SimError::ExperimentSetup(
+            "loaded state.rules_hash does not match the provided RuleSpec".into(),
+        ));
+    }
+    let n = (spec.world.grid_width as usize)
+        .checked_mul(spec.world.grid_height as usize)
+        .ok_or_else(|| SimError::ExperimentSetup("grid overflow".into()))?;
+    if state.fields.width != spec.world.grid_width || state.fields.height != spec.world.grid_height
+    {
+        return Err(SimError::ExperimentSetup("field size does not match spec".into()));
+    }
+    if state.fields.n.len() != n
+        || state.fields.o.len() != n
+        || state.fields.s.len() != n
+        || state.fields.q.len() != n
+        || state.fields.s_remainder.len() != n
+        || state.fields.q_remainder.len() != n
+    {
+        return Err(SimError::ExperimentSetup("field array length mismatch".into()));
+    }
+    if !state.future_inputs.is_empty() {
+        return Err(SimError::ExperimentSetup(
+            "non-empty future_inputs are not executed and must not be silently ignored".into(),
+        ));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut hashes = std::collections::BTreeSet::new();
+    for g in &state.genomes {
+        if !g.param_count_ok() {
+            return Err(SimError::ExperimentSetup("genome parameter count invalid".into()));
+        }
+        hashes.insert(g.hash);
+    }
+    for org in &state.organisms {
+        if !ids.insert(org.entity_id) {
+            return Err(SimError::ExperimentSetup("duplicate entity id".into()));
+        }
+        if !hashes.contains(&org.genome_hash) {
+            return Err(SimError::ExperimentSetup("organism genome hash missing".into()));
+        }
+        if !org.geom.x.is_finite() || !org.geom.y.is_finite() || !org.geom.theta.is_finite() {
+            return Err(SimError::ExperimentSetup("non-finite geometry".into()));
+        }
+        if !finite_brain(&org.brain) {
+            return Err(SimError::ExperimentSetup("non-finite brain state".into()));
+        }
+        if org.accounts.n > org.n_max
+            || org.accounts.c > org.c_max
+            || org.accounts.e_old.saturating_add(org.accounts.e_new) > org.e_max
+        {
+            return Err(SimError::ExperimentSetup("account exceeds capacity".into()));
+        }
+    }
+    Ok(())
 }

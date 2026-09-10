@@ -413,3 +413,192 @@ fn p0_energy_not_post_maintenance() {
     assert!((frame.obs[20] - want).abs() < 1e-12);
     assert!(w.last_probe.maint_paid + w.last_probe.cognition > 0);
 }
+
+#[test]
+fn f01_nan_unmasked_nboost_is_numeric_fault() {
+    use crate::brain::sample_policy;
+    let spec = reversal_spec();
+    let st = initialize_reversal_world(&spec, 3).unwrap();
+    let mut a = st.organisms[0].brain.a;
+    let mut phi = [0.0; universe_types::PHI];
+    phi[0] = 1.0;
+    let ok = sample_policy(&a, &phi, 3, 0, 1, false).unwrap();
+    assert!(ok.p_bin[0].is_finite());
+    a[6][0] = f64::NAN;
+    match sample_policy(&a, &phi, 3, 0, 1, false) {
+        Err(NumericFault::NonFinite) => {}
+        Err(e) => panic!("expected NonFinite, got {e}"),
+        Ok(_) => panic!("expected NonFinite, got Ok"),
+    }
+    a[6][0] = f64::INFINITY;
+    match sample_policy(&a, &phi, 3, 0, 1, false) {
+        Err(NumericFault::NonFinite) => {}
+        Err(e) => panic!("expected NonFinite, got {e}"),
+        Ok(_) => panic!("expected NonFinite, got Ok"),
+    }
+}
+
+#[test]
+fn f01_plus_inf_softmax_rejected_legal_mask_ok() {
+    use crate::brain::sample_policy;
+    let spec = reversal_spec();
+    let st = initialize_reversal_world(&spec, 3).unwrap();
+    let mut a = st.organisms[0].brain.a;
+    let mut phi = [0.0; universe_types::PHI];
+    phi[0] = 1.0;
+    sample_policy(&a, &phi, 3, 0, 1, false).unwrap();
+    a[0][0] = f64::INFINITY;
+    match sample_policy(&a, &phi, 3, 0, 1, false) {
+        Err(NumericFault::NonFinite) => {}
+        Err(e) => panic!("expected NonFinite, got {e}"),
+        Ok(_) => panic!("expected NonFinite, got Ok"),
+    }
+    let finite = st.organisms[0].brain.a;
+    crate::brain::sample_policy_masked(&finite, &phi, 3, 0, 1, false, true).unwrap();
+}
+
+#[test]
+fn f01_world_step_rolls_back_on_nan() {
+    let spec = reversal_spec();
+    let st = initialize_reversal_world(&spec, 21).unwrap();
+    let mut w = World::from_state(spec, st);
+    w.disable_reproduction = true;
+    w.control_mode = ControlMode::Neural;
+    let tick = w.state.tick;
+    let e = w.state.organisms[0].accounts.e_old;
+    let executed = w.run_ledger.executed_ticks;
+    let a00 = w.state.organisms[0].brain.a[0][0];
+    w.state.organisms[0].brain.a[6][0] = f64::NAN;
+    match w.step() {
+        Err(SimError::Numeric(NumericFault::NonFinite)) => {}
+        Err(e) => panic!("expected NonFinite, got {e}"),
+        Ok(()) => panic!("expected NonFinite, got Ok"),
+    }
+    assert_eq!(w.state.tick, tick);
+    assert_eq!(w.state.organisms[0].accounts.e_old, e);
+    assert_eq!(w.run_ledger.executed_ticks, executed);
+    assert_eq!(w.state.organisms[0].brain.a[0][0], a00);
+    assert!(w.state.organisms[0].brain.a[6][0].is_nan());
+    assert!(w.last_events.is_empty());
+}
+
+#[test]
+fn f08_disable_motion_overrides_forced_and_keeps_photo() {
+    let spec = reversal_spec();
+    let mut st = initialize_reversal_world(&spec, 9).unwrap();
+    st.organisms[0].geom.x = 4.5;
+    st.organisms[0].geom.y = 8.5;
+    st.organisms[0].geom.theta = 0.0;
+    let mut w = World::from_state(spec, st);
+    w.disable_reproduction = true;
+    w.disable_active_motion = true;
+    w.control_mode = ControlMode::Forced {
+        thrust: 1,
+        turn: 1,
+    };
+    w.freeze_learning = true;
+    for _ in 0..8 {
+        w.step().unwrap();
+    }
+    assert_eq!(w.run_ledger.thrust_attempt, 0);
+    assert_eq!(w.run_ledger.turn_attempt, 0);
+    assert!(
+        w.run_ledger.photo_extent > 0,
+        "motion disable must not turn off photosynthesis"
+    );
+}
+
+#[test]
+fn f04_update_norms_are_measured_not_placeholder_zero() {
+    let spec = reversal_spec();
+    let st = initialize_reversal_world(&spec, 21).unwrap();
+    let mut w = World::from_state(spec, st);
+    w.disable_reproduction = true;
+    w.freeze_learning = false;
+    w.control_mode = ControlMode::Neural;
+    w.enable_probe = true;
+    for _ in 0..6 {
+        w.step().unwrap();
+    }
+    let d0 = w.last_decisions.iter().find(|d| d.tick == 0).unwrap();
+    assert!(!d0.applied_update);
+    assert!(d0.actor_task_gradient_norm.is_none());
+    let d5 = w.last_decisions.iter().find(|d| d.tick == 5).unwrap();
+    assert!(d5.applied_update);
+    let n = d5.actor_task_gradient_norm.expect("task norm");
+    assert!(n.is_finite());
+    assert!(d5.entropy_term_norm.unwrap().is_finite());
+    assert!(d5.trace_norm_after_projection.unwrap().is_finite());
+}
+
+#[test]
+fn f04_probe_frames_are_bounded() {
+    let spec = reversal_spec();
+    let st = initialize_reversal_world(&spec, 7).unwrap();
+    let mut w = World::from_state(spec, st);
+    w.disable_reproduction = true;
+    w.freeze_learning = true;
+    w.control_mode = ControlMode::Stationary;
+    w.enable_probe = true;
+    w.probe_frame_limit = 3;
+    for _ in 0..40 {
+        w.step().unwrap();
+    }
+    assert!(w.last_decisions.len() <= 3);
+    assert!(w.probe_aggregate.n > 3);
+}
+
+#[test]
+fn f04_probe_does_not_change_state_hash() {
+    let spec = reversal_spec();
+    let st = initialize_reversal_world(&spec, 8).unwrap();
+    let mut a = World::from_state(spec.clone(), st.clone());
+    let mut b = World::from_state(spec, st);
+    a.disable_reproduction = true;
+    b.disable_reproduction = true;
+    a.freeze_learning = true;
+    b.freeze_learning = true;
+    a.control_mode = ControlMode::Stationary;
+    b.control_mode = ControlMode::Stationary;
+    a.enable_probe = true;
+    b.enable_probe = false;
+    for _ in 0..10 {
+        a.step().unwrap();
+        b.step().unwrap();
+    }
+    assert_eq!(state_hash(&a.state).unwrap(), state_hash(&b.state).unwrap());
+}
+
+#[test]
+fn f07_validate_lab_rejects_zero_divisors() {
+    let mut spec = reversal_spec();
+    spec.world.q_loss_divisor = 0;
+    assert!(spec.validate_lab().is_err());
+    spec = reversal_spec();
+    spec.physics.substeps = 0;
+    assert!(spec.validate_lab().is_err());
+    spec = reversal_spec();
+    spec.brain.leak_old = 0.5;
+    assert!(spec.validate_lab().is_err());
+}
+
+#[test]
+fn f04_known_update_norms_match_formula() {
+    use crate::brain::apply_readout_update;
+    use universe_types::{BrainState, PHI, POLICY_LOGITS};
+    let spec = reversal_spec();
+    let mut brain = BrainState::zeroed();
+    brain.phi_prev[0] = 1.0;
+    brain.e_a[0][0] = 2.0;
+    brain.r = 1.0;
+    brain.gamma = 0.0;
+    let a0 = [[0.0; PHI]; POLICY_LOGITS];
+    let mut phi = [0.0; PHI];
+    phi[0] = 1.0;
+    let stats = apply_readout_update(&mut brain, &a0, &phi, &spec).unwrap();
+    let task = stats.actor_task_gradient_norm.unwrap();
+    let expect = spec.brain.actor_lr * 1.0 * 2.0;
+    assert!((task - expect).abs() < 1e-12, "task={task} expect={expect}");
+    assert!(stats.entropy_term_norm.unwrap().abs() < 1e-15);
+}
+

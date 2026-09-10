@@ -1,0 +1,10 @@
+# sample decision frames (seed 10001, 40 ticks, limit 8)
+aggregate_n=8 updates=7
+tick=0 applied=false task_norm=None entropy_norm=None trace_after=None update_after=None obs_state_tick=0 feedback=[0,0) ticks=0
+tick=5 applied=true task_norm=Some(0.00036943904485174184) entropy_norm=Some(3.290271513793352e-5) trace_after=Some(1.5653312911647526) update_after=Some(0.00038364088762693753) obs_state_tick=5 feedback=[0,5) ticks=5
+tick=10 applied=true task_norm=Some(0.00032738651578441744) entropy_norm=Some(3.32347049996123e-5) trace_after=Some(1.3830001923350035) update_after=Some(0.0003342689774701638) obs_state_tick=10 feedback=[5,10) ticks=5
+tick=15 applied=true task_norm=Some(0.0003996522428514492) entropy_norm=Some(3.3692508394505214e-5) trace_after=Some(1.6787727066880789) update_after=Some(0.0004174712243671981) obs_state_tick=15 feedback=[10,15) ticks=5
+tick=20 applied=true task_norm=Some(0.000656729748483999) entropy_norm=Some(3.4211674936758584e-5) trace_after=Some(2.7477189128068296) update_after=Some(0.0006820269466006659) obs_state_tick=20 feedback=[15,20) ticks=5
+tick=25 applied=true task_norm=Some(0.0008559938656602475) entropy_norm=Some(3.4719776334936045e-5) trace_after=Some(3.5737012411606153) update_after=Some(0.0008787886457999177) obs_state_tick=25 feedback=[20,25) ticks=5
+tick=30 applied=true task_norm=Some(0.0007502499215379169) entropy_norm=Some(3.526555396091936e-5) trace_after=Some(3.1262853665988177) update_after=Some(0.0007708696921283124) obs_state_tick=30 feedback=[25,30) ticks=5
+tick=35 applied=true task_norm=Some(0.0009993272336711043) entropy_norm=Some(3.578679722690342e-5) trace_after=Some(4.159479116978848) update_after=Some(0.0010178710759767707) obs_state_tick=35 feedback=[30,35) ticks=5
